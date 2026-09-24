@@ -1,0 +1,20 @@
+[package]
+name = "join"
+version = "0.1.0"
+edition = "2021"
+
+# Dependencies are kept to a small, agreed set (see README.md). Each one is
+# added alongside the feature that needs it.
+[dependencies]
+tiny_http = "0.12"
+
+[[bin]]
+name = "join"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
