@@ -1,4 +1,4 @@
-//! join - device enrollment service for the homelab Wi-Fi.
+//! cert-enrolment - device certificate enrolment service for the homelab Wi-Fi.
 //!
 //! Plain HTTP only: NGINX terminates TLS for join.<domain> in front of it.
 
@@ -10,17 +10,17 @@ use tiny_http::{Header, Method, Response, Server};
 const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
 
 fn main() -> ExitCode {
-    let listen = env::var("JOIN_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
+    let listen = env::var("CERT_ENROLMENT_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
 
     let server = match Server::http(&listen) {
         Ok(server) => server,
         Err(err) => {
-            eprintln!("join: cannot listen on {listen}: {err}");
+            eprintln!("cert-enrolment: cannot listen on {listen}: {err}");
             return ExitCode::FAILURE;
         }
     };
 
-    eprintln!("join: listening on {listen}");
+    eprintln!("cert-enrolment: listening on {listen}");
 
     for request in server.incoming_requests() {
         let response = match (request.method(), request.url()) {
@@ -29,7 +29,7 @@ fn main() -> ExitCode {
         };
 
         if let Err(err) = request.respond(response) {
-            eprintln!("join: failed to send response: {err}");
+            eprintln!("cert-enrolment: failed to send response: {err}");
         }
     }
 

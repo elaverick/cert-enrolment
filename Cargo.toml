@@ -1,5 +1,5 @@
 [package]
-name = "join"
+name = "cert-enrolment"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,7 +9,7 @@ edition = "2021"
 tiny_http = "0.12"
 
 [[bin]]
-name = "join"
+name = "cert-enrolment"
 path = "src/main.rs"
 
 [profile.release]

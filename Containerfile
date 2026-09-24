@@ -7,10 +7,10 @@ RUN cargo build --release --locked
 
 # Runtime stage - just the binary.
 FROM debian:12-slim
-COPY --from=builder /src/target/release/join /usr/local/bin/join
+COPY --from=builder /src/target/release/cert-enrolment /usr/local/bin/cert-enrolment
 
-# Unlike podwatch, join needs no host access, so it runs unprivileged.
+# Unlike podwatch, cert-enrolment needs no host access, so it runs unprivileged.
 USER 65532:65532
 
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/join"]
+ENTRYPOINT ["/usr/local/bin/cert-enrolment"]

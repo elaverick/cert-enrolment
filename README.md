@@ -1,8 +1,8 @@
-# join
+# cert-enrolment
 
-Device enrollment service for the homelab trusted Wi-Fi.
+Device certificate enrolment service for the homelab trusted Wi-Fi.
 
-`join` lets a member of the LDAP `device-enrollers` group register a device
+`cert-enrolment` lets a member of the LDAP `device-enrollers` group register a device
 and download everything that device needs to join the 802.1X (EAP-TLS)
 network: a device certificate from the homelab step-ca, the Root CA, and the
 Wi-Fi configuration. It runs as a rootless Podman container behind NGINX at
@@ -11,19 +11,19 @@ Wi-Fi configuration. It runs as a rootless Podman container behind NGINX at
 ## How it fits together
 
 ```text
- browser on the device ──HTTPS──▶ NGINX ──HTTP──▶ join ──LDAPS──▶ LDAP
+ browser on the device ──HTTPS──▶ NGINX ──HTTP──▶ cert-enrolment ──LDAPS──▶ LDAP
                                                     │              (ou=Devices,
                                                     │               device-enrollers)
                                      signs single-use tokens
                                                     │
  device ──── CSR + token (Windows, Linux) ───────▶ step-ca
- device ──── SCEP (iOS) ─────────────────────────▶ step-ca ──webhook──▶ join
+ device ──── SCEP (iOS) ─────────────────────────▶ step-ca ──webhook──▶ cert-enrolment
                                                                   (challenge check)
 
  device ──── EAP-TLS ──▶ access point ──RADIUS──▶ FreeRADIUS ──▶ LDAP
 ```
 
-`join` never handles a device's private key and never calls step-ca itself.
+`cert-enrolment` never handles a device's private key and never calls step-ca itself.
 Its only outbound connection is to LDAP.
 
 ## Device identity
@@ -37,11 +37,11 @@ Its only outbound connection is to LDAP.
   CA, carries clientAuth and not serverAuth, has a device-domain CN, and
   matches an enabled `managedDevice`. `deviceZone` selects the VLAN.
 
-## Enrollment flow
+## Enrolment flow
 
 1. A `device-enrollers` member signs in with their LDAP credentials.
 2. They register a device (name, type, zone), which creates its LDAP entry.
-3. On the device itself they download the enrollment material for its
+3. On the device itself they download the enrolment material for its
    platform. Each download embeds a credential that is single-use, bound
    to that device name, and valid for about ten minutes.
 
@@ -49,7 +49,7 @@ Its only outbound connection is to LDAP.
 |---|---|---|---|---|
 | Windows 11 | PowerShell script, run once as administrator | TPM (Microsoft Platform Crypto Provider), machine store | step-ca JWK provisioner, single-use token | Scheduled task, mTLS renewal against step-ca |
 | Linux | Shell script | File, root-only | step-ca JWK provisioner, single-use token | systemd timer, `step ca renew` |
-| iOS | `.mobileconfig` profile (Root CA + SCEP + Wi-Fi) | Keychain | step-ca SCEP provisioner, challenge checked by `join` webhook | Re-download from `join` before expiry |
+| iOS | `.mobileconfig` profile (Root CA + SCEP + Wi-Fi) | Keychain | step-ca SCEP provisioner, challenge checked by `cert-enrolment` webhook | Re-download from `join.laverick.home.arpa` before expiry |
 
 The Wi-Fi configuration on every platform trusts only the homelab Root CA,
 validates the RADIUS server name, and uses TLS 1.3. Linux supplicants
@@ -86,18 +86,18 @@ cargo build --release
 or build the image:
 
 ```
-podman build -t join -f Containerfile .
+podman build -t cert-enrolment -f Containerfile .
 ```
 
-CI mirrors podwatch: `build-join.yaml` builds `./Containerfile` and pushes
-to `ghcr.io/<owner>/join` (`latest` on `main`, semver tags on `v*.*.*`),
+CI mirrors podwatch: `build-cert-enrolment.yaml` builds `./Containerfile` and pushes
+to `ghcr.io/<owner>/cert-enrolment` (`latest` on `main`, semver tags on `v*.*.*`),
 and `secret-scan.yaml` runs Gitleaks on every push and pull request.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `JOIN_LISTEN` | `0.0.0.0:8080` | Address and port to listen on |
+| `CERT_ENROLMENT_LISTEN` | `0.0.0.0:8080` | Address and port to listen on |
 
 ## Status
 
@@ -105,9 +105,9 @@ and `secret-scan.yaml` runs Gitleaks on every push and pull request.
 * [ ] LDAP sign-in restricted to `device-enrollers`
 * [ ] Device registration in `ou=Devices`
 * [ ] step-ca JWK provisioner and single-use token signing
-* [ ] Windows enrollment script
-* [ ] Linux enrollment script
+* [ ] Windows enrolment script
+* [ ] Linux enrolment script
 * [ ] step-ca SCEP provisioner and challenge webhook
-* [ ] iOS enrollment profile
+* [ ] iOS enrolment profile
 * [ ] Expiry view for devices that renew manually (iOS)
 * [ ] `homelab` deployment role, NGINX site and certificate

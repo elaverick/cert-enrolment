@@ -1,4 +1,4 @@
-name: Build join container
+name: Build cert-enrolment container
 
 on:
   push:
