@@ -7,6 +7,7 @@ edition = "2021"
 # added alongside the feature that needs it.
 [dependencies]
 tiny_http = "0.12"
+ldap3 = { version = "0.12", default-features = false, features = ["sync", "tls-rustls-ring"] }
 
 [[bin]]
 name = "cert-enrolment"

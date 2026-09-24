@@ -73,9 +73,12 @@ Agreed set, each added with the feature that needs it:
 | Crate | Purpose |
 |---|---|
 | `tiny_http` | HTTP server |
-| `ldap3` | LDAP bind and device entries |
+| `ldap3` | LDAP sign-in and device entries (sync API, rustls with ring; no OpenSSL) |
 | `p256`, `ecdsa`, `base64`, `serde_json` | Signing step-ca single-use tokens (ES256 JWS) |
-| `hmac`, `sha2` | Session cookies and CSRF tokens |
+
+`hmac` and `sha2` were originally planned for signed session cookies. Sessions
+are held in memory instead (see below), so they are not needed. Random
+tokens come from `/dev/urandom`.
 
 ## Build
 
@@ -98,11 +101,34 @@ and `secret-scan.yaml` runs Gitleaks on every push and pull request.
 | Variable | Default | Meaning |
 |---|---|---|
 | `CERT_ENROLMENT_LISTEN` | `0.0.0.0:8080` | Address and port to listen on |
+| `CERT_ENROLMENT_LDAP_URL` | required | LDAP server; must be `ldaps://` |
+| `CERT_ENROLMENT_LDAP_PEOPLE_DN` | required | Users sign in as `uid=<name>,<this DN>` |
+| `CERT_ENROLMENT_LDAP_ENROLLERS_GROUP_DN` | required | `posixGroup` whose `memberUid` values may sign in |
+| `CERT_ENROLMENT_SESSION_MINUTES` | `30` | Idle time before a session expires |
+| `SSL_CERT_FILE` | none | PEM file of CAs trusted for LDAPS. Set it to the homelab Root CA; the image has no other trust store |
+
+## Sign-in and sessions
+
+* Users sign in by binding to LDAP as themselves; `device-enrollers`
+  membership is then read over the same connection. Sign-in uses no service
+  account. Account lockout is enforced by the directory's password policy.
+* Empty passwords are refused before contacting LDAP, because an empty
+  password is an anonymous bind, which LDAP accepts.
+* User names are restricted to `[a-z0-9._-]`, and are escaped as well
+  before use in a DN or filter.
+* Sessions are random 256-bit tokens held in memory, so signing out really
+  ends a session. A restart signs everyone out. Sessions expire after
+  `CERT_ENROLMENT_SESSION_MINUTES` of inactivity.
+* Cookies are `__Host-` prefixed, `Secure`, `HttpOnly` and
+  `SameSite=Strict`. Every form carries a CSRF token; the sign-in form
+  uses a double-submit cookie.
+* Responses carry a restrictive Content Security Policy, `nosniff`,
+  `no-referrer` and `no-store`. All page values are HTML-escaped.
 
 ## Status
 
 * [x] Service skeleton, container image and CI
-* [ ] LDAP sign-in restricted to `device-enrollers`
+* [x] LDAP sign-in restricted to `device-enrollers`
 * [ ] Device registration in `ou=Devices`
 * [ ] step-ca JWK provisioner and single-use token signing
 * [ ] Windows enrolment script
