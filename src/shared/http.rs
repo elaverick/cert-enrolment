@@ -2,12 +2,14 @@
 
 use std::io::{Cursor, Read};
 
+use serde_json::Value;
 use tiny_http::{Header, Request, Response};
 
 pub type Reply = Response<Cursor<Vec<u8>>>;
 
-/// Largest request body accepted; sign-in forms are far smaller.
-const MAX_BODY: u64 = 8 * 1024;
+/// Largest request body accepted; forms and certificate requests are far
+/// smaller.
+const MAX_BODY: u64 = 16 * 1024;
 
 pub const SESSION_COOKIE: &str = "__Host-session";
 pub const LOGIN_CSRF_COOKIE: &str = "__Host-login-csrf";
@@ -40,13 +42,32 @@ pub fn read_form(request: &mut Request) -> Result<Vec<(String, String)>, ()> {
         .collect()
 }
 
+/// Reads a JSON request body.
+pub fn read_json(request: &mut Request) -> Result<Value, ()> {
+    let is_json = header(request, "Content-Type").is_some_and(|value| value.starts_with("application/json"));
+    if !is_json {
+        return Err(());
+    }
+
+    let mut body = Vec::new();
+    request
+        .as_reader()
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| ())?;
+    if body.len() as u64 > MAX_BODY {
+        return Err(());
+    }
+    serde_json::from_slice(&body).map_err(|_| ())
+}
+
 pub fn form_value<'a>(form: &'a [(String, String)], name: &str) -> &'a str {
     form.iter()
         .find(|(field, _)| field == name)
         .map_or("", |(_, value)| value.as_str())
 }
 
-fn percent_decode(input: &str) -> Result<String, ()> {
+pub fn percent_decode(input: &str) -> Result<String, ()> {
     let mut bytes = Vec::with_capacity(input.len());
     let mut iter = input.bytes();
     while let Some(b) = iter.next() {
@@ -124,6 +145,20 @@ pub fn asset(content_type: &str, body: &[u8]) -> Reply {
     headers(Response::from_data(body.to_vec()))
         .with_header(raw_header("Content-Type", content_type))
         .with_header(raw_header("Cache-Control", "public, max-age=3600"))
+}
+
+pub fn json(status: u16, body: &Value) -> Reply {
+    secure(Response::from_string(body.to_string()).with_status_code(status))
+        .with_header(raw_header("Content-Type", "application/json"))
+}
+
+/// A JSON error, `{"error": message}`.
+pub fn json_error(status: u16, message: &str) -> Reply {
+    json(status, &serde_json::json!({ "error": message }))
+}
+
+pub fn no_content() -> Reply {
+    secure(Response::from_string("").with_status_code(204))
 }
 
 /// A generated file offered for saving. It may hold a credential, so it is

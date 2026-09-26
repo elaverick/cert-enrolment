@@ -1,10 +1,12 @@
 //! step-ca single-use tokens.
 //!
-//! A device obtains its certificate by sending a CSR and one of these
-//! tokens to step-ca's `/1.0/sign`. The token is a JWT signed (ES256) with
-//! the private key of a step-ca JWK provisioner, and names exactly one
-//! device, so step-ca will only issue a certificate for that name. Its `jti`
-//! makes it single-use; step-ca records spent tokens in its database.
+//! The RA obtains a device certificate by sending a CSR and a sign token to
+//! step-ca's `/1.0/sign`, and revokes one by sending its serial and a revoke
+//! token to `/1.0/revoke`. Tokens are JWTs signed (ES256) with the private
+//! key of a step-ca JWK provisioner. A sign token names exactly one device,
+//! so step-ca will only issue a certificate for that name; a revoke token
+//! names exactly one serial. Each token's `jti` makes it single-use; step-ca
+//! records spent tokens in its database.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,10 +23,13 @@ pub struct Provisioner {
     name: String,
     /// Key id, which step-ca uses to find the provisioner.
     kid: String,
-    /// step-ca's sign endpoint, the token audience.
-    audience: String,
+    /// step-ca's base URL; token audiences are endpoints under it.
+    ca_url: String,
     key: SigningKey,
 }
+
+/// How long a token stays usable. The RA uses each token at once.
+const LIFETIME: Duration = Duration::from_secs(60);
 
 impl Provisioner {
     /// Loads a private EC P-256 JWK, as produced by `step crypto jwk create`,
@@ -59,30 +64,41 @@ impl Provisioner {
         Ok(Provisioner {
             name: name.to_string(),
             kid: field("kid")?.to_string(),
-            audience: format!("{}/1.0/sign", ca_url.trim_end_matches('/')),
+            ca_url: ca_url.trim_end_matches('/').to_string(),
             key,
         })
     }
 
-    /// Signs a token that lets the holder obtain one certificate for
-    /// `device_id`, within `lifetime`.
-    pub fn token(&self, device_id: &str, lifetime: Duration) -> Result<String, String> {
+    /// A token that lets the holder obtain one certificate for `device_id`.
+    pub fn sign_token(&self, device_id: &str) -> Result<String, String> {
+        self.token("/1.0/sign", device_id, Some(device_id), LIFETIME)
+    }
+
+    /// A token that lets the holder revoke the certificate with this serial
+    /// (in decimal, as step-ca identifies certificates).
+    pub fn revoke_token(&self, serial_decimal: &str) -> Result<String, String> {
+        self.token("/1.0/revoke", serial_decimal, None, LIFETIME)
+    }
+
+    fn token(&self, endpoint: &str, subject: &str, san: Option<&str>, lifetime: Duration) -> Result<String, String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "system clock is before 1970")?
             .as_secs();
 
         let header = json!({ "alg": "ES256", "typ": "JWT", "kid": self.kid });
-        let claims = json!({
+        let mut claims = json!({
             "iss": self.name,
-            "aud": self.audience,
-            "sub": device_id,
-            "sans": [device_id],
+            "aud": format!("{}{endpoint}", self.ca_url),
+            "sub": subject,
             "iat": now,
             "nbf": now,
             "exp": now + lifetime.as_secs(),
             "jti": random_token()?,
         });
+        if let Some(san) = san {
+            claims["sans"] = json!([san]);
+        }
 
         let signing_input = format!(
             "{}.{}",
@@ -121,11 +137,8 @@ mod tests {
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).unwrap()).unwrap()
     }
 
-    #[test]
-    fn tokens_are_signed_and_bound_to_one_device() {
-        let provisioner = Provisioner::new("https://ca.example.home.arpa/", "cert-enrolment", &test_jwk()).unwrap();
-        let token = provisioner.token("laptop.device.example.home.arpa", Duration::from_secs(600)).unwrap();
-
+    /// Checks the signature and returns the claims.
+    fn verified_claims(provisioner: &Provisioner, token: &str) -> Value {
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
 
@@ -133,38 +146,42 @@ mod tests {
         assert_eq!(header["alg"], "ES256");
         assert_eq!(header["kid"], "test-kid");
 
-        let claims = decode_part(parts[1]);
+        let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap()).unwrap();
+        VerifyingKey::from(&provisioner.key)
+            .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+            .expect("signature verifies");
+
+        decode_part(parts[1])
+    }
+
+    #[test]
+    fn sign_tokens_are_bound_to_one_device() {
+        let provisioner = Provisioner::new("https://ca.example.home.arpa/", "cert-enrolment", &test_jwk()).unwrap();
+        let claims = verified_claims(&provisioner, &provisioner.sign_token("laptop.device.example.home.arpa").unwrap());
+
         assert_eq!(claims["iss"], "cert-enrolment");
         assert_eq!(claims["aud"], "https://ca.example.home.arpa/1.0/sign");
         assert_eq!(claims["sub"], "laptop.device.example.home.arpa");
         assert_eq!(claims["sans"], json!(["laptop.device.example.home.arpa"]));
-        assert_eq!(claims["exp"].as_u64().unwrap() - claims["nbf"].as_u64().unwrap(), 600);
+        assert_eq!(claims["exp"].as_u64().unwrap() - claims["nbf"].as_u64().unwrap(), 60);
         assert_eq!(claims["jti"].as_str().unwrap().len(), 64);
-
-        let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap()).unwrap();
-        let verifying_key = VerifyingKey::from(&provisioner.key);
-        verifying_key
-            .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
-            .expect("signature verifies");
     }
 
-    /// Prints a token for a real step-ca, for integration testing:
-    /// `TOKEN_JWK_FILE=... TOKEN_CA_URL=... TOKEN_PROVISIONER=... TOKEN_DEVICE=...
-    /// cargo test mint_token -- --ignored --nocapture`
     #[test]
-    #[ignore = "integration helper; needs a provisioner key from the environment"]
-    fn mint_token() {
-        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"));
-        let jwk = std::fs::read_to_string(var("TOKEN_JWK_FILE")).unwrap();
-        let provisioner = Provisioner::new(&var("TOKEN_CA_URL"), &var("TOKEN_PROVISIONER"), &jwk).unwrap();
-        println!("TOKEN={}", provisioner.token(&var("TOKEN_DEVICE"), Duration::from_secs(600)).unwrap());
+    fn revoke_tokens_name_one_serial() {
+        let provisioner = Provisioner::new("https://ca.example.home.arpa", "cert-enrolment", &test_jwk()).unwrap();
+        let claims = verified_claims(&provisioner, &provisioner.revoke_token("123456789").unwrap());
+
+        assert_eq!(claims["aud"], "https://ca.example.home.arpa/1.0/revoke");
+        assert_eq!(claims["sub"], "123456789");
+        assert!(claims.get("sans").is_none());
     }
 
     #[test]
     fn each_token_is_unique() {
         let provisioner = Provisioner::new("https://ca", "p", &test_jwk()).unwrap();
-        let a = provisioner.token("a.device", Duration::from_secs(60)).unwrap();
-        let b = provisioner.token("a.device", Duration::from_secs(60)).unwrap();
+        let a = provisioner.sign_token("a.device").unwrap();
+        let b = provisioner.sign_token("a.device").unwrap();
         assert_ne!(decode_part(a.split('.').nth(1).unwrap())["jti"], decode_part(b.split('.').nth(1).unwrap())["jti"]);
     }
 

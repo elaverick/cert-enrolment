@@ -5,28 +5,23 @@
 
 mod assets;
 mod config;
-mod devices;
 mod directory;
 mod enrolment;
 mod pages;
+mod ra_client;
 mod session;
-mod token;
 
 use std::process::ExitCode;
-use std::time::Duration;
 
 use tiny_http::{Method, Request, Server};
 
-use config::Config;
-use devices::{Change, Platform, Registration};
-use directory::SignIn;
+use crate::shared::device::{device_id, label_from_id, valid_description, valid_label, Platform};
 use crate::shared::http::{self, Reply, LOGIN_CSRF_COOKIE, SESSION_COOKIE};
 use crate::shared::random::{random_token, tokens_match};
+use config::Config;
+use directory::SignIn;
+use ra_client::{RaClient, RaError};
 use session::Sessions;
-use token::Provisioner;
-
-/// How long a downloaded enrolment script's token stays usable.
-const TOKEN_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 pub fn run() -> ExitCode {
     let config = match Config::from_env() {
@@ -37,15 +32,7 @@ pub fn run() -> ExitCode {
         }
     };
 
-    // Checked at start-up so that a bad key fails the deployment, not the
-    // first enrolment.
-    let provisioner = match token::Provisioner::new(&config.ca_url, &config.provisioner_name, &config.provisioner_key) {
-        Ok(provisioner) => provisioner,
-        Err(err) => {
-            eprintln!("cert-enrolment: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let ra = RaClient::new(&config.ra_url, &config.ra_api_key);
 
     let server = match Server::http(&config.listen) {
         Ok(server) => server,
@@ -60,7 +47,7 @@ pub fn run() -> ExitCode {
     let mut sessions = Sessions::new(config.session_idle);
 
     for mut request in server.incoming_requests() {
-        let response = route(&config, &provisioner, &mut sessions, &mut request);
+        let response = route(&config, &ra, &mut sessions, &mut request);
 
         if let Err(err) = request.respond(response) {
             eprintln!("cert-enrolment: failed to send response: {err}");
@@ -70,7 +57,7 @@ pub fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn route(config: &Config, provisioner: &Provisioner, sessions: &mut Sessions, request: &mut Request) -> Reply {
+fn route(config: &Config, ra: &RaClient, sessions: &mut Sessions, request: &mut Request) -> Reply {
     let path = request.url().split('?').next().unwrap_or("/").to_string();
 
     if *request.method() == Method::Get {
@@ -86,13 +73,13 @@ fn route(config: &Config, provisioner: &Provisioner, sessions: &mut Sessions, re
             None => http::redirect("/login"),
         },
         (Method::Get, "/enrol") => enrol_form(config, sessions, request),
-        (Method::Post, "/enrol") => register_device(config, sessions, request),
-        (Method::Get, "/enrol/device") => enrolled(config, sessions, request),
-        (Method::Post, "/enrol/download") => download_script(config, provisioner, sessions, request),
-        (Method::Get, "/devices") => device_list(config, sessions, request),
-        (Method::Post, "/devices/disable") => device_action(config, sessions, request, Action::Disable),
-        (Method::Post, "/devices/enable") => device_action(config, sessions, request, Action::Enable),
-        (Method::Post, "/devices/delete") => device_action(config, sessions, request, Action::Delete),
+        (Method::Post, "/enrol") => register_device(config, ra, sessions, request),
+        (Method::Get, "/enrol/device") => enrolled(ra, sessions, request),
+        (Method::Post, "/enrol/download") => download_script(config, ra, sessions, request),
+        (Method::Get, "/devices") => device_list(config, ra, sessions, request),
+        (Method::Post, "/devices/disable") => device_action(config, ra, sessions, request, Action::Disable),
+        (Method::Post, "/devices/enable") => device_action(config, ra, sessions, request, Action::Enable),
+        (Method::Post, "/devices/delete") => device_action(config, ra, sessions, request, Action::Delete),
         (Method::Get, "/login") => sign_in_form(sessions, request),
         (Method::Post, "/login") => sign_in(config, sessions, request),
         (Method::Post, "/logout") => sign_out(sessions, request),
@@ -120,6 +107,13 @@ fn session_form(request: &mut Request, user: &SignedIn) -> Option<Vec<(String, S
 fn unavailable(err: &str) -> Reply {
     eprintln!("cert-enrolment: {err}");
     http::html(503, pages::unavailable())
+}
+
+fn ra_unavailable(err: RaError) -> Reply {
+    match err {
+        RaError::Unavailable(reason) => unavailable(&reason),
+        RaError::Rejected { status, message } => unavailable(&format!("the RA refused a request (HTTP {status}): {message}")),
+    }
 }
 
 // Enrolment
@@ -156,7 +150,7 @@ fn enrol_page(config: &Config, user: &SignedIn, status: u16, form: &DeviceForm, 
     )
 }
 
-fn register_device(config: &Config, sessions: &mut Sessions, request: &mut Request) -> Reply {
+fn register_device(config: &Config, ra: &RaClient, sessions: &mut Sessions, request: &mut Request) -> Reply {
     let Some(user) = signed_in(sessions, request) else {
         return http::redirect("/login");
     };
@@ -170,9 +164,9 @@ fn register_device(config: &Config, sessions: &mut Sessions, request: &mut Reque
     let zone = http::form_value(&form, "zone");
     let refill = DeviceForm { label: &label, description, platform, zone };
 
-    let problem = if !devices::valid_label(&label) {
+    let problem = if !valid_label(&label) {
         Some("Device names are 1 to 63 lowercase letters, digits and hyphens, and cannot start or end with a hyphen.")
-    } else if !devices::valid_description(description) {
+    } else if !valid_description(description) {
         Some("Descriptions are up to 64 characters, on one line.")
     } else if !config.device_zones.iter().any(|allowed| allowed == zone) {
         Some("Choose one of the listed network zones.")
@@ -185,39 +179,38 @@ fn register_device(config: &Config, sessions: &mut Sessions, request: &mut Reque
         return enrol_page(config, &user, 400, &refill, problem);
     };
 
-    match devices::register(config, &label, description, platform, zone, &user.username) {
-        Ok(Registration::Registered(id)) => {
-            eprintln!("cert-enrolment: {} registered {id} ({}, zone {zone})", user.username, platform.id());
+    match ra.create(&user.username, &label, description, platform.id(), zone) {
+        Ok(device) => {
+            eprintln!("cert-enrolment: {} registered {} ({}, zone {zone})", user.username, device.id, platform.id());
             http::redirect(&format!("/enrol/device?device={label}"))
         }
-        Ok(Registration::AlreadyExists(id)) => {
-            let error = format!("{id} is already registered.");
-            enrol_page(config, &user, 409, &refill, Some(&error))
+        Err(RaError::Rejected { status: status @ (400 | 409), message }) => {
+            enrol_page(config, &user, status, &refill, Some(&message))
         }
-        Err(err) => unavailable(&err),
+        Err(err) => ra_unavailable(err),
     }
 }
 
 /// Step 3 for a registered device, named by the validated `device` query
 /// parameter.
-fn enrolled(config: &Config, sessions: &mut Sessions, request: &Request) -> Reply {
+fn enrolled(ra: &RaClient, sessions: &mut Sessions, request: &Request) -> Reply {
     let Some(user) = signed_in(sessions, request) else {
         return http::redirect("/login");
     };
-    let Some(label) = http::query_value(request, "device").filter(|label| devices::valid_label(label)) else {
+    let Some(label) = http::query_value(request, "device").filter(|label| valid_label(label)) else {
         return http::redirect("/enrol");
     };
 
-    match devices::get(config, label) {
+    match ra.get(&user.username, label) {
         Ok(Some(device)) => http::html(200, pages::enrolled(&device, &user.csrf_token, None)),
         Ok(None) => http::redirect("/enrol"),
-        Err(err) => unavailable(&err),
+        Err(err) => ra_unavailable(err),
     }
 }
 
 /// Returns the enrolment script for a registered, enabled device, with a
-/// fresh single-use token written in.
-fn download_script(config: &Config, provisioner: &Provisioner, sessions: &mut Sessions, request: &mut Request) -> Reply {
+/// fresh single-use enrolment code from the RA written in.
+fn download_script(config: &Config, ra: &RaClient, sessions: &mut Sessions, request: &mut Request) -> Reply {
     let Some(user) = signed_in(sessions, request) else {
         return http::redirect("/login");
     };
@@ -225,14 +218,14 @@ fn download_script(config: &Config, provisioner: &Provisioner, sessions: &mut Se
         return http::text(400, "bad request\n");
     };
     let label = http::form_value(&form, "device");
-    if !devices::valid_label(label) {
+    if !valid_label(label) {
         return http::text(400, "bad request\n");
     }
 
-    let device = match devices::get(config, label) {
+    let device = match ra.get(&user.username, label) {
         Ok(Some(device)) => device,
         Ok(None) => return http::redirect("/enrol"),
-        Err(err) => return unavailable(&err),
+        Err(err) => return ra_unavailable(err),
     };
     if device.disabled {
         let error = "This device is disabled. Enable it under Devices before enrolling it.";
@@ -242,11 +235,14 @@ fn download_script(config: &Config, provisioner: &Provisioner, sessions: &mut Se
     let Some(platform) = Platform::from_id(&device.platform) else {
         return http::text(400, "bad request\n");
     };
-    let token = match provisioner.token(&device.id, TOKEN_LIFETIME) {
-        Ok(token) => token,
-        Err(err) => return unavailable(&err),
+    let code = match ra.enrolment_code(&user.username, label) {
+        Ok(code) => code,
+        Err(RaError::Rejected { status: 409, message }) => {
+            return http::html(409, pages::enrolled(&device, &user.csrf_token, Some(&message)));
+        }
+        Err(err) => return ra_unavailable(err),
     };
-    let Some(script) = enrolment::script(config, platform, label, &device.id, &token) else {
+    let Some(script) = enrolment::script(config, platform, label, &device.id, &code) else {
         return http::text(400, "bad request\n");
     };
 
@@ -284,7 +280,7 @@ impl Action {
     }
 }
 
-fn device_list(config: &Config, sessions: &mut Sessions, request: &Request) -> Reply {
+fn device_list(config: &Config, ra: &RaClient, sessions: &mut Sessions, request: &Request) -> Reply {
     let Some(user) = signed_in(sessions, request) else {
         return http::redirect("/login");
     };
@@ -292,24 +288,24 @@ fn device_list(config: &Config, sessions: &mut Sessions, request: &Request) -> R
     // Set by the redirect after a change. Both values are validated, so
     // nothing from the URL reaches the page unchecked.
     let notice = http::query_value(request, "device")
-        .filter(|label| devices::valid_label(label))
+        .filter(|label| valid_label(label))
         .zip(http::query_value(request, "done").and_then(|done| Action::ALL.into_iter().find(|a| a.done() == done)))
-        .map(|(label, action)| format!("{} {}.", action.past_tense(), devices::device_id(config, label)));
+        .map(|(label, action)| format!("{} {}.", action.past_tense(), device_id(&config.device_domain, label)));
 
-    device_list_page(config, &user, 200, notice.as_deref(), None)
+    device_list_page(ra, &user, 200, notice.as_deref(), None)
 }
 
-fn device_list_page(config: &Config, user: &SignedIn, status: u16, notice: Option<&str>, error: Option<&str>) -> Reply {
-    match devices::list(config) {
+fn device_list_page(ra: &RaClient, user: &SignedIn, status: u16, notice: Option<&str>, error: Option<&str>) -> Reply {
+    match ra.list(&user.username) {
         Ok(device_list) => http::html(status, pages::devices(&device_list, &user.csrf_token, notice, error)),
-        Err(err) => unavailable(&err),
+        Err(err) => ra_unavailable(err),
     }
 }
 
 /// Disables, enables or deletes the device named by the form's `id`.
 /// Deleting first shows a confirmation page, which posts back with
 /// `confirm=yes`.
-fn device_action(config: &Config, sessions: &mut Sessions, request: &mut Request, action: Action) -> Reply {
+fn device_action(config: &Config, ra: &RaClient, sessions: &mut Sessions, request: &mut Request, action: Action) -> Reply {
     let Some(user) = signed_in(sessions, request) else {
         return http::redirect("/login");
     };
@@ -318,29 +314,29 @@ fn device_action(config: &Config, sessions: &mut Sessions, request: &mut Request
     };
 
     let id = http::form_value(&form, "id");
-    let Some(label) = devices::label_from_id(&config.device_domain, id) else {
-        return device_list_page(config, &user, 400, None, Some("That is not a device name."));
+    let Some(label) = label_from_id(&config.device_domain, id) else {
+        return device_list_page(ra, &user, 400, None, Some("That is not a device name."));
     };
 
     let result = match action {
         Action::Delete if http::form_value(&form, "confirm") != "yes" => {
             return http::html(200, pages::confirm_delete(id, &user.csrf_token));
         }
-        Action::Delete => devices::delete(config, label),
-        Action::Disable => devices::set_disabled(config, label, true),
-        Action::Enable => devices::set_disabled(config, label, false),
+        Action::Delete => ra.delete(&user.username, label),
+        Action::Disable => ra.set_disabled(&user.username, label, true),
+        Action::Enable => ra.set_disabled(&user.username, label, false),
     };
 
     match result {
-        Ok(Change::Done) => {
+        Ok(()) => {
             eprintln!("cert-enrolment: {} {} {id}", user.username, action.done());
             http::redirect(&format!("/devices?done={}&device={label}", action.done()))
         }
-        Ok(Change::NotFound) => {
-            let error = format!("{id} is not registered.");
-            device_list_page(config, &user, 404, None, Some(&error))
+        // Not registered, or deleted but not all certificates revoked yet.
+        Err(RaError::Rejected { status: status @ (404 | 502), message }) => {
+            device_list_page(ra, &user, status, None, Some(&message))
         }
-        Err(err) => unavailable(&err),
+        Err(err) => ra_unavailable(err),
     }
 }
 
@@ -382,7 +378,7 @@ fn sign_in(config: &Config, sessions: &mut Sessions, request: &mut Request) -> R
         return sign_in_page(400, username, Some("The sign-in form expired. Please try again."));
     }
 
-    let who = if directory::valid_username(username) { username } else { "<invalid user name>" };
+    let who = if crate::shared::user::valid_username(username) { username } else { "<invalid user name>" };
 
     match directory::sign_in(config, username, password) {
         Ok(SignIn::Allowed) => match sessions.create(username) {

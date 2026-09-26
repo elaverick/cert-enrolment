@@ -9,6 +9,7 @@ use std::time::Duration;
 use ldap3::{dn_escape, ldap_escape, LdapConn, LdapConnSettings, LdapError, Scope};
 
 use super::config::Config;
+use crate::shared::user::valid_username;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -20,18 +21,6 @@ pub enum SignIn {
     Allowed,
     NotEnroller,
     InvalidCredentials,
-}
-
-/// A user name is a single uid value. Restricting it keeps it safe to place
-/// in a DN and a filter, even before escaping.
-pub fn valid_username(username: &str) -> bool {
-    let valid_chars = username
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b));
-
-    (1..=64).contains(&username.len())
-        && valid_chars
-        && !username.starts_with(['-', '.'])
 }
 
 pub fn sign_in(config: &Config, username: &str, password: &str) -> Result<SignIn, String> {
@@ -71,22 +60,4 @@ fn is_enroller(ldap: &mut LdapConn, config: &Config, username: &str) -> Result<S
         .map_err(|err| format!("group lookup failed: {err}"))?;
 
     Ok(if entries.is_empty() { SignIn::NotEnroller } else { SignIn::Allowed })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::valid_username;
-
-    #[test]
-    fn accepts_ordinary_uids() {
-        assert!(valid_username("alice"));
-        assert!(valid_username("b.smith-2"));
-    }
-
-    #[test]
-    fn rejects_unsafe_or_empty_uids() {
-        for name in ["", "-x", ".x", "Alice", "a,b", "a)(uid=*", "a b", "é", &"a".repeat(65)] {
-            assert!(!valid_username(name), "{name:?} should be rejected");
-        }
-    }
 }

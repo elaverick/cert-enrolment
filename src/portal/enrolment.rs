@@ -1,13 +1,13 @@
 //! Enrolment scripts for Windows and Linux.
 //!
 //! Each download is a script with the device's values and a fresh
-//! single-use token written in. Every value is checked at start-up or
+//! single-use enrolment code written in. Every value is checked at start-up or
 //! registration (device names, the CA URL, the SSID, the RADIUS server name
 //! and the Root CA all have restricted formats), and is also quoted for the
 //! script language, so no value can change the script's meaning.
 
 use super::config::Config;
-use super::devices::Platform;
+use crate::shared::device::Platform;
 
 const WINDOWS: &str = include_str!("assets/enrol-windows.ps1");
 const LINUX: &str = include_str!("assets/enrol-linux.sh");
@@ -20,10 +20,10 @@ pub struct Script {
 
 /// Renders the enrolment script for a device, or `None` for platforms that
 /// are not enrolled by script.
-pub fn script(config: &Config, platform: Platform, label: &str, device_id: &str, token: &str) -> Option<Script> {
+pub fn script(config: &Config, platform: Platform, label: &str, device_id: &str, code: &str) -> Option<Script> {
     match platform {
         Platform::Windows => {
-            let body = fill(WINDOWS, config, label, device_id, token, powershell_quote)
+            let body = fill(WINDOWS, config, label, device_id, code, powershell_quote)
                 .replace("\r\n", "\n")
                 .replace('\n', "\r\n");
             Some(Script {
@@ -35,7 +35,7 @@ pub fn script(config: &Config, platform: Platform, label: &str, device_id: &str,
         Platform::Linux => Some(Script {
             file_name: format!("enrol-{label}.sh"),
             content_type: "text/x-shellscript; charset=us-ascii",
-            body: fill(LINUX, config, label, device_id, token, shell_quote).replace("\r\n", "\n"),
+            body: fill(LINUX, config, label, device_id, code, shell_quote).replace("\r\n", "\n"),
         }),
         Platform::Ios => None,
     }
@@ -44,13 +44,13 @@ pub fn script(config: &Config, platform: Platform, label: &str, device_id: &str,
 /// Fills a template. Values inside single-quoted string literals are quoted
 /// with `quote`; the rest (label, device id, Root CA) are restricted to
 /// characters that need no quoting.
-fn fill(template: &str, config: &Config, label: &str, device_id: &str, token: &str, quote: fn(&str) -> String) -> String {
+fn fill(template: &str, config: &Config, label: &str, device_id: &str, code: &str, quote: fn(&str) -> String) -> String {
     template
         .replace("{{LABEL}}", label)
         .replace("'{{DEVICE_ID}}'", &quote(device_id))
         .replace("{{DEVICE_ID}}", device_id)
-        .replace("'{{CA_URL}}'", &quote(&config.ca_url))
-        .replace("'{{TOKEN}}'", &quote(token))
+        .replace("'{{RA_URL}}'", &quote(&config.ra_public_url))
+        .replace("'{{CODE}}'", &quote(code))
         .replace("'{{SSID}}'", &quote(&config.wifi_ssid))
         .replace("'{{RADIUS_SERVER_NAME}}'", &quote(&config.radius_server_name))
         .replace("{{ROOT_CA_PEM}}", &config.root_ca_pem)
@@ -96,10 +96,10 @@ mod tests {
     #[test]
     fn templates_have_every_placeholder_quoted() {
         for (name, template) in [("windows", WINDOWS), ("linux", LINUX)] {
-            for field in ["DEVICE_ID", "CA_URL", "TOKEN", "SSID", "RADIUS_SERVER_NAME"] {
+            for field in ["DEVICE_ID", "RA_URL", "CODE", "SSID", "RADIUS_SERVER_NAME"] {
                 assert!(template.contains(&format!("'{{{{{field}}}}}'")), "{name}: {field} is not assigned as a quoted literal");
             }
-            for field in ["CA_URL", "TOKEN", "SSID", "RADIUS_SERVER_NAME"] {
+            for field in ["RA_URL", "CODE", "SSID", "RADIUS_SERVER_NAME"] {
                 assert_eq!(
                     template.matches(&format!("{{{{{field}}}}}")).count(),
                     1,

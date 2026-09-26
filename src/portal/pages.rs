@@ -1,6 +1,6 @@
 //! Page rendering. Every value placed into a page is HTML-escaped here.
 
-use super::devices::{Device, Platform, DESCRIPTION_MAX};
+use crate::shared::device::{Device, Platform, DESCRIPTION_MAX};
 use crate::shared::http::escape;
 
 const LAYOUT: &str = include_str!("assets/layout.html");
