@@ -9,6 +9,7 @@ mod directory;
 mod http;
 mod pages;
 mod session;
+mod token;
 
 use std::process::ExitCode;
 
@@ -28,6 +29,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Checked at start-up so that a bad key fails the deployment, not the
+    // first enrolment.
+    let provisioner = match token::Provisioner::new(&config.ca_url, &config.provisioner_name, &config.provisioner_key) {
+        Ok(provisioner) => provisioner,
+        Err(err) => {
+            eprintln!("cert-enrolment: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _ = &provisioner;
 
     let server = match Server::http(&config.listen) {
         Ok(server) => server,

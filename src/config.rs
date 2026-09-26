@@ -26,6 +26,11 @@ pub struct Config {
     pub device_domain: String,
     /// Network zones a device may be placed in; the first is the default.
     pub device_zones: Vec<String>,
+    /// step-ca base URL, as devices reach it.
+    pub ca_url: String,
+    /// JWK provisioner that signs enrolment tokens, and its private key.
+    pub provisioner_name: String,
+    pub provisioner_key: String,
     /// Sessions expire after this long without a request.
     pub session_idle: Duration,
 }
@@ -57,6 +62,14 @@ impl Config {
 
         let device_zones = parse_zones(&required("CERT_ENROLMENT_DEVICE_ZONES")?)?;
 
+        let ca_url = required("CERT_ENROLMENT_CA_URL")?;
+        if !ca_url.starts_with("https://") {
+            return Err("CERT_ENROLMENT_CA_URL must use https://".to_string());
+        }
+
+        let key_file = required("CERT_ENROLMENT_PROVISIONER_KEY_FILE")?;
+        let provisioner_key = fs::read_to_string(&key_file).map_err(|err| format!("cannot read {key_file}: {err}"))?;
+
         Ok(Config {
             listen: env::var("CERT_ENROLMENT_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_string()),
             ldap_url,
@@ -67,6 +80,9 @@ impl Config {
             ldap_devices_dn: required("CERT_ENROLMENT_LDAP_DEVICES_DN")?,
             device_domain: required("CERT_ENROLMENT_DEVICE_DOMAIN")?.to_ascii_lowercase(),
             device_zones,
+            ca_url,
+            provisioner_name: required("CERT_ENROLMENT_PROVISIONER")?,
+            provisioner_key,
             session_idle: Duration::from_secs(session_minutes * 60),
         })
     }

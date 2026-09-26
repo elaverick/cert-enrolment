@@ -128,6 +128,21 @@ only the Root CA, validates the RADIUS server name, and uses TLS 1.3. Linux
 supplicants (wpa_supplicant 2.10) disable EAP TLS 1.3 by default, so the
 Linux script enables it explicitly.
 
+## Enrolment tokens
+
+* step-ca has a JWK provisioner whose **public** key is in its configuration;
+  `cert-enrolment` holds the **private** key. Nothing else needs it, so the
+  key is not stored encrypted in the CA configuration.
+* Each token is an ES256 JWT for one device name (`sub` and `sans`), with a
+  random `jti`, valid for ten minutes. step-ca records spent tokens, so each
+  can be used once.
+* The provisioner's certificate template issues clientAuth only; the CA
+  policy must allow the device domain (one label deep, as step-ca
+  wildcards match a single label).
+* Keep the provisioner key stable. Certificates record which provisioner
+  issued them, and renewals are checked against it; a new key means every
+  device must enrol again.
+
 ## Certificates
 
 * 30-day lifetime on every platform.
@@ -220,6 +235,9 @@ Linux script enables it explicitly.
 | `CERT_ENROLMENT_LDAP_DEVICES_DN` | required | Container of device entries |
 | `CERT_ENROLMENT_DEVICE_DOMAIN` | required | Device identities are `<name>.<this domain>` |
 | `CERT_ENROLMENT_DEVICE_ZONES` | required | Comma-separated zones offered at registration; the first is the default. Must match the zones FreeRADIUS maps to VLANs |
+| `CERT_ENROLMENT_CA_URL` | required | step-ca base URL as devices reach it; must be `https://`. Tokens are issued for `<this URL>/1.0/sign` |
+| `CERT_ENROLMENT_PROVISIONER` | required | Name of the step-ca JWK provisioner whose key signs enrolment tokens |
+| `CERT_ENROLMENT_PROVISIONER_KEY_FILE` | required | File holding that provisioner's private key as an EC P-256 JWK (for example a container secret). Checked at start-up |
 | `CERT_ENROLMENT_SESSION_MINUTES` | `30` | Idle time before a session expires |
 | `SSL_CERT_FILE` | none | PEM file of CAs trusted for LDAPS. Set it to your Root CA; the image has no other trust store |
 
@@ -271,7 +289,7 @@ request.
 * [x] Device registration
 * [x] Disable, enable and delete devices
 * [x] Reference deployment (homelab role, NGINX site and certificate)
-* [ ] step-ca JWK provisioner and single-use token signing
+* [x] step-ca JWK provisioner and single-use token signing
 * [ ] Windows enrolment script
 * [ ] Linux enrolment script
 * [ ] Onboarding: HTTP bootstrap page with the Root CA, and captive-portal setup

@@ -8,6 +8,9 @@ edition = "2021"
 [dependencies]
 tiny_http = "0.12"
 ldap3 = { version = "0.12", default-features = false, features = ["sync", "tls-rustls-ring"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
+base64 = "0.23"
+serde_json = "1"
 
 [[bin]]
 name = "cert-enrolment"
