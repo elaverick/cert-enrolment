@@ -2,6 +2,7 @@
 //!
 //! Plain HTTP only: NGINX terminates TLS for join.<domain> in front of it.
 
+mod assets;
 mod config;
 mod devices;
 mod directory;
@@ -54,11 +55,22 @@ fn main() -> ExitCode {
 fn route(config: &Config, sessions: &mut Sessions, request: &mut Request) -> Reply {
     let path = request.url().split('?').next().unwrap_or("/").to_string();
 
+    if *request.method() == Method::Get {
+        if let Some(asset) = assets::get(&path) {
+            return asset;
+        }
+    }
+
     match (request.method(), path.as_str()) {
         (Method::Get, "/healthz") => http::text(200, "ok\n"),
-        (Method::Get, "/style.css") => http::css(pages::STYLE),
-        (Method::Get, "/") => home(config, sessions, request),
-        (Method::Post, "/devices") => register_device(config, sessions, request),
+        (Method::Get, "/") => match signed_in(sessions, request) {
+            Some(_) => http::redirect("/enrol"),
+            None => http::redirect("/login"),
+        },
+        (Method::Get, "/enrol") => enrol_form(config, sessions, request),
+        (Method::Post, "/enrol") => register_device(config, sessions, request),
+        (Method::Get, "/enrol/device") => enrolled(config, sessions, request),
+        (Method::Get, "/devices") => device_list(config, sessions, request),
         (Method::Post, "/devices/disable") => device_action(config, sessions, request, Action::Disable),
         (Method::Post, "/devices/enable") => device_action(config, sessions, request, Action::Enable),
         (Method::Post, "/devices/delete") => device_action(config, sessions, request, Action::Delete),
@@ -80,96 +92,46 @@ fn signed_in(sessions: &mut Sessions, request: &Request) -> Option<SignedIn> {
     Some(SignedIn { username: session.username.clone(), csrf_token: session.csrf_token.clone() })
 }
 
+/// Reads a POSTed form and checks it carries the session's CSRF token.
+fn session_form(request: &mut Request, user: &SignedIn) -> Option<Vec<(String, String)>> {
+    let form = http::read_form(request).ok()?;
+    tokens_match(&user.csrf_token, http::form_value(&form, "csrf")).then_some(form)
+}
+
+fn unavailable(err: &str) -> Reply {
+    eprintln!("cert-enrolment: {err}");
+    http::html(503, pages::unavailable())
+}
+
+// Enrolment
+
 /// Values the registration form is refilled with after an error.
 #[derive(Default)]
 struct DeviceForm<'a> {
     label: &'a str,
+    description: &'a str,
     platform: Option<Platform>,
     zone: &'a str,
 }
 
-fn home(config: &Config, sessions: &mut Sessions, request: &Request) -> Reply {
+fn enrol_form(config: &Config, sessions: &mut Sessions, request: &Request) -> Reply {
     let Some(user) = signed_in(sessions, request) else {
         return http::redirect("/login");
     };
-
-    // Set by the redirect after a successful change. Both values are
-    // validated, so nothing from the URL reaches the page unchecked.
-    let notice = http::query_value(request, "device")
-        .filter(|label| devices::valid_label(label))
-        .zip(http::query_value(request, "done").and_then(Action::from_done))
-        .map(|(label, action)| format!("{} {}.", action.past_tense(), devices::device_id(config, label)));
-
-    home_page(config, &user, 200, &DeviceForm::default(), notice.as_deref(), None)
+    enrol_page(config, &user, 200, &DeviceForm::default(), None)
 }
 
-/// Completed changes, as reported back to the home page.
-#[derive(Clone, Copy)]
-enum Action {
-    Register,
-    Disable,
-    Enable,
-    Delete,
-}
-
-impl Action {
-    fn done(self) -> &'static str {
-        match self {
-            Action::Register => "registered",
-            Action::Disable => "disabled",
-            Action::Enable => "enabled",
-            Action::Delete => "deleted",
-        }
-    }
-
-    fn from_done(done: &str) -> Option<Action> {
-        [Action::Register, Action::Disable, Action::Enable, Action::Delete]
-            .into_iter()
-            .find(|action| action.done() == done)
-    }
-
-    fn past_tense(self) -> &'static str {
-        match self {
-            Action::Register => "Registered",
-            Action::Disable => "Disabled",
-            Action::Enable => "Enabled",
-            Action::Delete => "Deleted",
-        }
-    }
-}
-
-fn done_redirect(action: Action, label: &str) -> Reply {
-    http::redirect(&format!("/?done={}&device={label}", action.done()))
-}
-
-fn home_page(
-    config: &Config,
-    user: &SignedIn,
-    status: u16,
-    form: &DeviceForm,
-    notice: Option<&str>,
-    error: Option<&str>,
-) -> Reply {
-    let device_list = match devices::list(config) {
-        Ok(device_list) => device_list,
-        Err(err) => {
-            eprintln!("cert-enrolment: {err}");
-            return http::html(503, pages::unavailable());
-        }
-    };
-
+fn enrol_page(config: &Config, user: &SignedIn, status: u16, form: &DeviceForm, error: Option<&str>) -> Reply {
     http::html(
         status,
-        pages::home(&pages::Home {
-            username: &user.username,
+        pages::enrol(&pages::EnrolForm {
             csrf_token: &user.csrf_token,
-            devices: &device_list,
             device_domain: &config.device_domain,
             zones: &config.device_zones,
             label: form.label,
+            description: form.description,
             platform: form.platform,
             zone: form.zone,
-            notice,
             error,
         }),
     )
@@ -179,47 +141,110 @@ fn register_device(config: &Config, sessions: &mut Sessions, request: &mut Reque
     let Some(user) = signed_in(sessions, request) else {
         return http::redirect("/login");
     };
-
-    let Ok(form) = http::read_form(request) else {
+    let Some(form) = session_form(request, &user) else {
         return http::text(400, "bad request\n");
     };
-    if !tokens_match(&user.csrf_token, http::form_value(&form, "csrf")) {
-        return http::text(400, "bad request\n");
-    }
 
     let label = http::form_value(&form, "label").trim().to_ascii_lowercase();
+    let description = http::form_value(&form, "description").trim();
     let platform = Platform::from_id(http::form_value(&form, "platform"));
     let zone = http::form_value(&form, "zone");
-    let refill = DeviceForm { label: &label, platform, zone };
+    let refill = DeviceForm { label: &label, description, platform, zone };
 
     let problem = if !devices::valid_label(&label) {
         Some("Device names are 1 to 63 lowercase letters, digits and hyphens, and cannot start or end with a hyphen.")
+    } else if !devices::valid_description(description) {
+        Some("Descriptions are up to 64 characters, on one line.")
     } else if !config.device_zones.iter().any(|allowed| allowed == zone) {
         Some("Choose one of the listed network zones.")
+    } else if platform.is_none() {
+        Some("Choose one of the listed device types.")
     } else {
         None
     };
-    let Some(platform) = platform.filter(|_| problem.is_none()) else {
-        return home_page(config, &user, 400, &refill, None, Some(problem.unwrap_or("Choose one of the listed platforms.")));
+    let (None, Some(platform)) = (problem, platform) else {
+        return enrol_page(config, &user, 400, &refill, problem);
     };
 
-    match devices::register(config, &label, platform, zone, &user.username) {
+    match devices::register(config, &label, description, platform, zone, &user.username) {
         Ok(Registration::Registered(id)) => {
-            eprintln!(
-                "cert-enrolment: {} registered {id} ({}, zone {zone})",
-                user.username,
-                platform.id()
-            );
-            done_redirect(Action::Register, &label)
+            eprintln!("cert-enrolment: {} registered {id} ({}, zone {zone})", user.username, platform.id());
+            http::redirect(&format!("/enrol/device?device={label}"))
         }
         Ok(Registration::AlreadyExists(id)) => {
             let error = format!("{id} is already registered.");
-            home_page(config, &user, 409, &refill, None, Some(&error))
+            enrol_page(config, &user, 409, &refill, Some(&error))
         }
-        Err(err) => {
-            eprintln!("cert-enrolment: {err}");
-            http::html(503, pages::unavailable())
+        Err(err) => unavailable(&err),
+    }
+}
+
+/// Step 3 for a registered device, named by the validated `device` query
+/// parameter.
+fn enrolled(config: &Config, sessions: &mut Sessions, request: &Request) -> Reply {
+    let Some(user) = signed_in(sessions, request) else {
+        return http::redirect("/login");
+    };
+    let Some(label) = http::query_value(request, "device").filter(|label| devices::valid_label(label)) else {
+        return http::redirect("/enrol");
+    };
+
+    match devices::get(config, label) {
+        Ok(Some(device)) => http::html(200, pages::enrolled(&device, &user.csrf_token)),
+        Ok(None) => http::redirect("/enrol"),
+        Err(err) => unavailable(&err),
+    }
+}
+
+// Device management
+
+/// Changes made from the device list, reported back to it after a redirect.
+#[derive(Clone, Copy)]
+enum Action {
+    Disable,
+    Enable,
+    Delete,
+}
+
+impl Action {
+    const ALL: [Action; 3] = [Action::Disable, Action::Enable, Action::Delete];
+
+    fn done(self) -> &'static str {
+        match self {
+            Action::Disable => "disabled",
+            Action::Enable => "enabled",
+            Action::Delete => "deleted",
         }
+    }
+
+    fn past_tense(self) -> &'static str {
+        match self {
+            Action::Disable => "Disabled",
+            Action::Enable => "Enabled",
+            Action::Delete => "Deleted",
+        }
+    }
+}
+
+fn device_list(config: &Config, sessions: &mut Sessions, request: &Request) -> Reply {
+    let Some(user) = signed_in(sessions, request) else {
+        return http::redirect("/login");
+    };
+
+    // Set by the redirect after a change. Both values are validated, so
+    // nothing from the URL reaches the page unchecked.
+    let notice = http::query_value(request, "device")
+        .filter(|label| devices::valid_label(label))
+        .zip(http::query_value(request, "done").and_then(|done| Action::ALL.into_iter().find(|a| a.done() == done)))
+        .map(|(label, action)| format!("{} {}.", action.past_tense(), devices::device_id(config, label)));
+
+    device_list_page(config, &user, 200, notice.as_deref(), None)
+}
+
+fn device_list_page(config: &Config, user: &SignedIn, status: u16, notice: Option<&str>, error: Option<&str>) -> Reply {
+    match devices::list(config) {
+        Ok(device_list) => http::html(status, pages::devices(&device_list, &user.csrf_token, notice, error)),
+        Err(err) => unavailable(&err),
     }
 }
 
@@ -230,17 +255,13 @@ fn device_action(config: &Config, sessions: &mut Sessions, request: &mut Request
     let Some(user) = signed_in(sessions, request) else {
         return http::redirect("/login");
     };
-
-    let Ok(form) = http::read_form(request) else {
+    let Some(form) = session_form(request, &user) else {
         return http::text(400, "bad request\n");
     };
-    if !tokens_match(&user.csrf_token, http::form_value(&form, "csrf")) {
-        return http::text(400, "bad request\n");
-    }
 
     let id = http::form_value(&form, "id");
     let Some(label) = devices::label_from_id(&config.device_domain, id) else {
-        return home_page(config, &user, 400, &DeviceForm::default(), None, Some("That is not a device name."));
+        return device_list_page(config, &user, 400, None, Some("That is not a device name."));
     };
 
     let result = match action {
@@ -250,28 +271,26 @@ fn device_action(config: &Config, sessions: &mut Sessions, request: &mut Request
         Action::Delete => devices::delete(config, label),
         Action::Disable => devices::set_disabled(config, label, true),
         Action::Enable => devices::set_disabled(config, label, false),
-        Action::Register => return http::text(404, "not found\n"),
     };
 
     match result {
         Ok(Change::Done) => {
             eprintln!("cert-enrolment: {} {} {id}", user.username, action.done());
-            done_redirect(action, label)
+            http::redirect(&format!("/devices?done={}&device={label}", action.done()))
         }
         Ok(Change::NotFound) => {
             let error = format!("{id} is not registered.");
-            home_page(config, &user, 404, &DeviceForm::default(), None, Some(&error))
+            device_list_page(config, &user, 404, None, Some(&error))
         }
-        Err(err) => {
-            eprintln!("cert-enrolment: {err}");
-            http::html(503, pages::unavailable())
-        }
+        Err(err) => unavailable(&err),
     }
 }
 
+// Sign-in
+
 fn sign_in_form(sessions: &mut Sessions, request: &Request) -> Reply {
-    if http::cookie(request, SESSION_COOKIE).and_then(|token| sessions.get(token)).is_some() {
-        return http::redirect("/");
+    if signed_in(sessions, request).is_some() {
+        return http::redirect("/enrol");
     }
     sign_in_page(200, "", None)
 }
@@ -311,14 +330,11 @@ fn sign_in(config: &Config, sessions: &mut Sessions, request: &mut Request) -> R
         Ok(SignIn::Allowed) => match sessions.create(username) {
             Ok(token) => {
                 eprintln!("cert-enrolment: sign-in allowed for {who}");
-                http::redirect("/")
+                http::redirect("/enrol")
                     .with_header(http::set_cookie(SESSION_COOKIE, &token))
                     .with_header(http::clear_cookie(LOGIN_CSRF_COOKIE))
             }
-            Err(err) => {
-                eprintln!("cert-enrolment: sign-in for {who} failed: {err}");
-                http::html(503, pages::unavailable())
-            }
+            Err(err) => unavailable(&format!("sign-in for {who} failed: {err}")),
         },
         Ok(SignIn::NotEnroller) => {
             eprintln!("cert-enrolment: sign-in refused for {who}: not in the enrollers group");
@@ -328,10 +344,7 @@ fn sign_in(config: &Config, sessions: &mut Sessions, request: &mut Request) -> R
             eprintln!("cert-enrolment: sign-in failed for {who}: invalid credentials");
             sign_in_page(401, username, Some("Incorrect user name or password."))
         }
-        Err(err) => {
-            eprintln!("cert-enrolment: sign-in for {who} failed: {err}");
-            http::html(503, pages::unavailable())
-        }
+        Err(err) => unavailable(&format!("sign-in for {who} failed: {err}")),
     }
 }
 

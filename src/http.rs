@@ -118,9 +118,12 @@ pub fn text(status: u16, body: &str) -> Reply {
         .with_header(raw_header("Content-Type", "text/plain; charset=utf-8"))
 }
 
-pub fn css(body: &str) -> Reply {
-    secure(Response::from_string(body))
-        .with_header(raw_header("Content-Type", "text/css; charset=utf-8"))
+/// A static asset embedded in the binary. Assets change only with a new
+/// image, so they may be cached briefly.
+pub fn asset(content_type: &str, body: &[u8]) -> Reply {
+    headers(Response::from_data(body.to_vec()))
+        .with_header(raw_header("Content-Type", content_type))
+        .with_header(raw_header("Cache-Control", "public, max-age=3600"))
 }
 
 /// 303 so that a POST is followed by a GET.
@@ -129,15 +132,20 @@ pub fn redirect(location: &str) -> Reply {
         .with_header(raw_header("Location", location))
 }
 
+/// Pages and redirects are personal, so they are never cached.
 fn secure(response: Reply) -> Reply {
+    headers(response).with_header(raw_header("Cache-Control", "no-store"))
+}
+
+fn headers(response: Reply) -> Reply {
     response
         .with_header(raw_header(
             "Content-Security-Policy",
-            "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; \
+             form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
         ))
         .with_header(raw_header("X-Content-Type-Options", "nosniff"))
         .with_header(raw_header("Referrer-Policy", "no-referrer"))
-        .with_header(raw_header("Cache-Control", "no-store"))
 }
 
 fn raw_header(name: &str, value: &str) -> Header {

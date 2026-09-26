@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice">
+  <!-- Halftone spheres: a dot pattern, shaded by a radial mask lit from the top left. -->
+  <defs>
+    <pattern id="dots" width="9" height="9" patternUnits="userSpaceOnUse">
+      <circle cx="4.5" cy="4.5" r="1.25" fill="{{dot}}"/>
+    </pattern>
+    <radialGradient id="light" cx="0.5" cy="0.5" r="0.5" fx="0.3" fy="0.28">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.04"/>
+      <stop offset="0.45" stop-color="#fff" stop-opacity="0.3"/>
+      <stop offset="0.8" stop-color="#fff" stop-opacity="0.75"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0.95"/>
+    </radialGradient>
+    <mask id="shade" maskContentUnits="objectBoundingBox">
+      <rect width="1" height="1" fill="url(#light)"/>
+    </mask>
+  </defs>
+  <g fill="url(#dots)" opacity="{{opacity}}">
+    <circle cx="90" cy="360" r="250" mask="url(#shade)"/>
+    <circle cx="170" cy="880" r="230" mask="url(#shade)"/>
+    <circle cx="410" cy="170" r="95" mask="url(#shade)"/>
+    <circle cx="330" cy="700" r="80" mask="url(#shade)"/>
+    <circle cx="640" cy="40" r="140" mask="url(#shade)"/>
+    <circle cx="1100" cy="190" r="165" mask="url(#shade)"/>
+    <circle cx="1440" cy="190" r="100" mask="url(#shade)"/>
+    <circle cx="1240" cy="440" r="70" mask="url(#shade)"/>
+    <circle cx="1480" cy="720" r="290" mask="url(#shade)"/>
+    <circle cx="1030" cy="930" r="95" mask="url(#shade)"/>
+    <circle cx="700" cy="980" r="120" mask="url(#shade)"/>
+    <circle cx="240" cy="40" r="40" mask="url(#shade)"/>
+    <circle cx="1360" cy="40" r="35" mask="url(#shade)"/>
+    <circle cx="880" cy="60" r="30" mask="url(#shade)"/>
+  </g>
+</svg>

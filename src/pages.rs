@@ -1,15 +1,56 @@
 //! Page rendering. Every value placed into a page is HTML-escaped here.
 
-use crate::devices::{Device, Platform};
+use crate::devices::{Device, Platform, DESCRIPTION_MAX};
 use crate::http::escape;
 
-pub const STYLE: &str = include_str!("pages/style.css");
-const LAYOUT: &str = include_str!("pages/layout.html");
+const LAYOUT: &str = include_str!("assets/layout.html");
 
-fn page(title: &str, content: &str) -> String {
+/// Top navigation entries for a signed-in user.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Enrol,
+    Devices,
+    /// A page reached from a section but not itself in the navigation.
+    Other,
+}
+
+/// Sign-out is a form, so it carries the session's CSRF token.
+fn navigation(active: Section, csrf_token: &str) -> String {
+    let link = |section: Section, href: &str, label: &str| {
+        let current = if section == active { r#" aria-current="page""# } else { "" };
+        format!(r#"<li><a href="{href}"{current}>{label}</a></li>"#)
+    };
+
+    format!(
+        r#"<nav aria-label="Main">
+<ul>
+{enrol}
+{devices}
+<li><form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="link">Sign out</button></form></li>
+</ul>
+</nav>"#,
+        enrol = link(Section::Enrol, "/enrol", "Enrol a device"),
+        devices = link(Section::Devices, "/devices", "Devices"),
+        csrf = escape(csrf_token),
+    )
+}
+
+struct Page<'a> {
+    title: &'a str,
+    subtitle: &'a str,
+    /// Navigation markup, empty when signed out.
+    nav: String,
+    wide: bool,
+    content: String,
+}
+
+fn render(page: Page) -> String {
     LAYOUT
-        .replace("{{title}}", &escape(title))
-        .replace("{{content}}", content)
+        .replace("{{title}}", &escape(page.title))
+        .replace("{{subtitle}}", &escape(page.subtitle))
+        .replace("{{main_class}}", if page.wide { r#" class="wide""# } else { "" })
+        .replace("{{nav}}", &page.nav)
+        .replace("{{content}}", &page.content)
 }
 
 fn message(class: &str, text: Option<&str>) -> String {
@@ -17,126 +58,237 @@ fn message(class: &str, text: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// The enrolment progress indicator. Sign-in always comes first, so it is
+/// complete on every page that shows the steps.
+fn steps(current: usize) -> String {
+    const NAMES: [&str; 4] = ["Sign in", "Device", "Enrol", "Connect"];
+
+    let items: String = NAMES
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let number = index + 1;
+            if number < current {
+                format!(
+                    r#"<li class="done"><span class="step-marker" aria-hidden="true">{TICK}</span>{name}<span class="visually-hidden"> (complete)</span></li>"#
+                )
+            } else if number == current {
+                format!(r#"<li aria-current="step"><span class="step-marker" aria-hidden="true">{number}</span>{name}</li>"#)
+            } else {
+                format!(r#"<li><span class="step-marker" aria-hidden="true">{number}</span>{name}</li>"#)
+            }
+        })
+        .collect();
+
+    format!(r#"<ol class="steps" aria-label="Enrolment progress">{items}</ol>"#)
+}
+
+fn platform_label(platform: &str) -> &str {
+    Platform::from_id(platform).map_or(platform, |p| p.label())
+}
+
 pub fn sign_in(csrf_token: &str, username: &str, error: Option<&str>) -> String {
-    page(
-        "Sign in",
-        &format!(
-            r#"{error}<form method="post" action="/login">
+    render(Page {
+        title: "Sign in",
+        subtitle: "Sign in with your home network account to enrol and manage devices.",
+        nav: String::new(),
+        wide: false,
+        content: format!(
+            r#"<section class="card">
+{error}<form method="post" action="/login">
 <input type="hidden" name="csrf" value="{csrf}">
 <label for="username">User name</label>
 <input type="text" id="username" name="username" value="{username}" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
 <label for="password">Password</label>
 <input type="password" id="password" name="password" autocomplete="current-password" required>
-<button type="submit">Sign in</button>
-</form>"#,
+<button type="submit" class="block">Sign in</button>
+</form>
+</section>"#,
             error = message("error", error),
             csrf = escape(csrf_token),
             username = escape(username),
         ),
-    )
+    })
 }
 
-/// Everything the home page shows.
-pub struct Home<'a> {
-    pub username: &'a str,
+/// The registration form, refilled after an error.
+pub struct EnrolForm<'a> {
     pub csrf_token: &'a str,
-    pub devices: &'a [Device],
     pub device_domain: &'a str,
     pub zones: &'a [String],
-    /// Values to refill the registration form with after an error.
     pub label: &'a str,
+    pub description: &'a str,
+    /// Set when the server chose the platform, which the browser keeps.
     pub platform: Option<Platform>,
     pub zone: &'a str,
-    pub notice: Option<&'a str>,
     pub error: Option<&'a str>,
 }
 
-pub fn home(view: &Home) -> String {
-    let rows: String = view
-        .devices
+pub fn enrol(form: &EnrolForm) -> String {
+    let platforms: String = Platform::ALL
+        .iter()
+        .map(|platform| {
+            let selected = if form.platform == Some(*platform) { " selected" } else { "" };
+            format!(r#"<option value="{}"{selected}>{}</option>"#, platform.id(), platform.label())
+        })
+        .collect();
+
+    let zones: String = form
+        .zones
+        .iter()
+        .map(|zone| {
+            let selected = if zone == form.zone { " selected" } else { "" };
+            format!(r#"<option value="{zone}"{selected}>{zone}</option>"#, zone = escape(zone))
+        })
+        .collect();
+
+    let chosen = if form.platform.is_some() { r#" data-chosen="1""# } else { "" };
+
+    render(Page {
+        title: "Connect a new device",
+        subtitle: "Enrol a device certificate to securely connect to the trusted Wi-Fi.",
+        nav: navigation(Section::Enrol, form.csrf_token),
+        wide: false,
+        content: format!(
+            r#"{steps}
+<section class="card" aria-labelledby="identify">
+<h2 id="identify">2. Identify your device</h2>
+<p class="muted">Tell us about the device you’re connecting so we can issue a device certificate.</p>
+{error}<form method="post" action="/enrol">
+<input type="hidden" name="csrf" value="{csrf}">
+<div class="card-body">
+<div>
+<label for="platform">Device type</label>
+<select id="platform" name="platform" required{chosen}>{platforms}</select>
+<p id="platform-detected" class="hint" hidden>Detected from this browser.</p>
+<label for="label">Device name</label>
+<div class="suffixed">
+<input type="text" id="label" name="label" value="{label}" pattern="[a-z0-9]([a-z0-9\-]{{0,61}}[a-z0-9])?" maxlength="63" autocapitalize="none" spellcheck="false" required aria-describedby="label-hint">
+<span>.{domain}</span>
+</div>
+<p id="label-hint" class="hint">Lowercase letters, digits and hyphens, such as ed-laptop.
+<span data-tip="windows" hidden>This PC’s name is under Settings › System › About.</span>
+<span data-tip="linux" hidden>Run <code>hostname</code> to see this computer’s name.</span>
+<span data-tip="ios" hidden>This device’s name is under Settings › General › About › Name.</span></p>
+<label for="description">Description <span class="optional">(optional)</span></label>
+<input type="text" id="description" name="description" value="{description}" maxlength="{description_max}" aria-describedby="description-hint">
+<p id="description-hint" class="hint">A friendly name to help you recognise this device later.</p>
+<label for="zone">Network zone</label>
+<select id="zone" name="zone" required>{zones}</select>
+</div>
+<div class="illustration" aria-hidden="true">{computer}{phone}</div>
+</div>
+<button type="submit" class="block">Continue {arrow}</button>
+</form>
+<hr>
+<div class="next">
+<h3>What happens next?</h3>
+<ol>
+<li><span class="step-marker" aria-hidden="true">3</span><strong>Enrol the device</strong><span class="detail">We’ll issue and install a device certificate.</span></li>
+<li><span class="step-marker" aria-hidden="true">4</span><strong>Connect to Wi-Fi</strong><span class="detail">Your device will join the trusted Wi-Fi network automatically.</span></li>
+</ol>
+</div>
+</section>"#,
+            steps = steps(2),
+            error = message("error", form.error),
+            csrf = escape(form.csrf_token),
+            label = escape(form.label),
+            domain = escape(form.device_domain),
+            description = escape(form.description),
+            description_max = DESCRIPTION_MAX,
+            computer = COMPUTER_ILLUSTRATION,
+            phone = PHONE_ILLUSTRATION,
+            arrow = ARROW,
+        ),
+    })
+}
+
+/// Step 3, shown once the device is registered.
+pub fn enrolled(device: &Device, csrf_token: &str) -> String {
+    let description = if device.description.is_empty() {
+        String::new()
+    } else {
+        format!("<dt>Description</dt><dd>{}</dd>", escape(&device.description))
+    };
+
+    render(Page {
+        title: "Connect a new device",
+        subtitle: "Enrol a device certificate to securely connect to the trusted Wi-Fi.",
+        nav: navigation(Section::Other, csrf_token),
+        wide: false,
+        content: format!(
+            r#"{steps}
+<section class="card" aria-labelledby="enrol">
+<h2 id="enrol">3. Enrol the device</h2>
+<p class="notice" role="status">Registered {id}.</p>
+<dl class="summary">
+<dt>Device</dt><dd>{id}</dd>
+{description}
+<dt>Type</dt><dd>{platform}</dd>
+<dt>Zone</dt><dd>{zone}</dd>
+</dl>
+<p>Certificate enrolment for {platform} is not available yet. The device is registered and will appear under Devices; once enrolment is ready, you will download its enrolment file here.</p>
+<a href="/devices" class="button secondary">Go to devices</a>
+</section>"#,
+            steps = steps(3),
+            id = escape(&device.id),
+            platform = escape(platform_label(&device.platform)),
+            zone = escape(&device.zone),
+        ),
+    })
+}
+
+pub fn devices(devices: &[Device], csrf_token: &str, notice: Option<&str>, error: Option<&str>) -> String {
+    let rows: String = devices
         .iter()
         .map(|device| {
-            let platform = Platform::from_id(&device.platform).map_or(device.platform.as_str(), |p| p.label());
             let (status, toggle_action, toggle_label) = if device.disabled {
-                ("Disabled", "enable", "Enable")
+                (r#"<span class="status-disabled">Disabled</span>"#, "enable", "Enable")
             } else {
                 ("Enabled", "disable", "Disable")
             };
+            let description = if device.description.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<span class="detail">{}</span>"#, escape(&device.description))
+            };
             format!(
-                r#"<tr><td>{id}</td><td>{platform}</td><td>{zone}</td><td>{status}</td><td class="actions">{toggle}{delete}</td></tr>
+                r#"<tr><td>{id}{description}</td><td data-label="Type">{platform}</td><td data-label="Zone">{zone}</td><td data-label="Status">{status}</td><td class="actions">{toggle}{delete}</td></tr>
 "#,
                 id = escape(&device.id),
-                platform = escape(platform),
+                platform = escape(platform_label(&device.platform)),
                 zone = escape(&device.zone),
-                toggle = action_form(toggle_action, toggle_label, &device.id, view.csrf_token, "secondary"),
-                delete = action_form("delete", "Delete", &device.id, view.csrf_token, "danger"),
+                toggle = action_form(toggle_action, toggle_label, &device.id, csrf_token, "secondary"),
+                delete = action_form("delete", "Delete", &device.id, csrf_token, "danger"),
             )
         })
         .collect();
 
-    let devices = if rows.is_empty() {
-        r#"<p class="muted">No devices are registered yet.</p>"#.to_string()
+    let list = if rows.is_empty() {
+        r#"<p class="muted">No devices are registered yet. <a href="/enrol">Enrol a device</a>.</p>"#.to_string()
     } else {
         format!(
             r#"<div class="table-wrap"><table>
-<thead><tr><th scope="col">Device</th><th scope="col">Platform</th><th scope="col">Zone</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead>
+<thead><tr><th scope="col">Device</th><th scope="col">Type</th><th scope="col">Zone</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead>
 <tbody>
 {rows}</tbody>
 </table></div>"#
         )
     };
 
-    let platforms: String = Platform::ALL
-        .iter()
-        .map(|platform| {
-            let selected = if view.platform == Some(*platform) { " selected" } else { "" };
-            format!(r#"<option value="{}"{selected}>{}</option>"#, platform.id(), platform.label())
-        })
-        .collect();
-
-    let zones: String = view
-        .zones
-        .iter()
-        .map(|zone| {
-            let selected = if zone == view.zone { " selected" } else { "" };
-            format!(r#"<option value="{zone}"{selected}>{zone}</option>"#, zone = escape(zone))
-        })
-        .collect();
-
-    page(
-        "Device enrolment",
-        &format!(
-            r#"<p>Signed in as <strong>{username}</strong>.</p>
-{notice}{error}
-<h2>Devices</h2>
-{devices}
-<h2>Register a device</h2>
-<form method="post" action="/devices">
-<input type="hidden" name="csrf" value="{csrf}">
-<label for="label">Device name</label>
-<div class="suffixed">
-<input type="text" id="label" name="label" value="{label}" pattern="[a-z0-9]([a-z0-9-]{{0,61}}[a-z0-9])?" maxlength="63" autocapitalize="none" spellcheck="false" required aria-describedby="label-help">
-<span>.{domain}</span>
-</div>
-<p id="label-help" class="muted">Lowercase letters, digits and hyphens.</p>
-<label for="platform">Platform</label>
-<select id="platform" name="platform" required>{platforms}</select>
-<label for="zone">Network zone</label>
-<select id="zone" name="zone" required>{zones}</select>
-<button type="submit">Register device</button>
-</form>
-<form method="post" action="/logout" class="sign-out">
-<input type="hidden" name="csrf" value="{csrf}">
-<button type="submit" class="secondary">Sign out</button>
-</form>"#,
-            username = escape(view.username),
-            notice = message("notice", view.notice),
-            error = message("error", view.error),
-            csrf = escape(view.csrf_token),
-            label = escape(view.label),
-            domain = escape(view.device_domain),
+    render(Page {
+        title: "Devices",
+        subtitle: "Devices registered for the trusted Wi-Fi. Disabled devices are refused at their next connection.",
+        nav: navigation(Section::Devices, csrf_token),
+        wide: true,
+        content: format!(
+            r#"<section class="card" aria-label="Registered devices">
+{notice}{error}{list}
+</section>"#,
+            notice = message("notice", notice),
+            error = message("error", error),
         ),
-    )
+    })
 }
 
 /// A one-button form that posts a device id to /devices/<action>. The
@@ -154,29 +306,54 @@ fn action_form(action: &str, label: &str, id: &str, csrf_token: &str, class: &st
 }
 
 pub fn confirm_delete(id: &str, csrf_token: &str) -> String {
-    page(
-        "Delete device",
-        &format!(
-            r#"<p>Delete <strong>{id}</strong>?</p>
-<p>It will no longer be able to join the trusted network. To use it again, register and enrol it again.</p>
+    render(Page {
+        title: "Delete device",
+        subtitle: "Deleted devices can no longer join the trusted Wi-Fi.",
+        nav: navigation(Section::Devices, csrf_token),
+        wide: false,
+        content: format!(
+            r#"<section class="card">
+<p>Delete <strong>{id}</strong>?</p>
+<p class="muted">To use it again, you will need to enrol it again.</p>
 <form method="post" action="/devices/delete">
 <input type="hidden" name="csrf" value="{csrf}">
 <input type="hidden" name="id" value="{id}">
 <input type="hidden" name="confirm" value="yes">
 <div class="button-row">
 <button type="submit" class="danger">Delete device</button>
-<a href="/" class="button secondary">Cancel</a>
+<a href="/devices" class="button secondary">Cancel</a>
 </div>
-</form>"#,
+</form>
+</section>"#,
             id = escape(id),
             csrf = escape(csrf_token),
         ),
-    )
+    })
 }
 
 pub fn unavailable() -> String {
-    page(
-        "Directory unavailable",
-        r#"<p>The directory could not be reached. Try again shortly.</p><p><a href="/">Back</a></p>"#,
-    )
+    render(Page {
+        title: "Directory unavailable",
+        subtitle: "The directory could not be reached. Try again shortly.",
+        nav: String::new(),
+        wide: false,
+        content: r#"<section class="card"><a href="/" class="button secondary">Try again</a></section>"#.to_string(),
+    })
 }
+
+const TICK: &str = r#"<svg viewBox="0 0 16 16" width="14" height="14" focusable="false"><path d="M3 8.5l3.2 3L13 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+
+const ARROW: &str = r#"<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true" focusable="false"><path d="M3 10h13M11 5l5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+
+const COMPUTER_ILLUSTRATION: &str = r#"<svg data-illustration="computer" viewBox="0 0 180 130" focusable="false">
+<path d="M38 12h110a4 4 0 0 1 4 4l-8 86H30l4-86a4 4 0 0 1 4-4z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
+<path d="M42 20h100l-7 74H37z" fill="none" stroke="currentColor" stroke-width="1" opacity=".5"/>
+<path d="M6 104h168l-6 10H14z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
+<path d="M74 108h32" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+</svg>"#;
+
+const PHONE_ILLUSTRATION: &str = r#"<svg data-illustration="phone" viewBox="0 0 180 130" focusable="false" hidden>
+<rect x="62" y="6" width="56" height="118" rx="10" fill="none" stroke="currentColor" stroke-width="2.2"/>
+<rect x="67" y="18" width="46" height="94" rx="3" fill="none" stroke="currentColor" stroke-width="1" opacity=".5"/>
+<path d="M82 12h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+</svg>"#;

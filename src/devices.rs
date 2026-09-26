@@ -42,7 +42,7 @@ impl Platform {
         match self {
             Platform::Windows => "Windows",
             Platform::Linux => "Linux",
-            Platform::Ios => "iOS",
+            Platform::Ios => "iPhone / iPad",
         }
     }
 
@@ -53,6 +53,8 @@ impl Platform {
 
 pub struct Device {
     pub id: String,
+    /// Optional friendly description, e.g. "Edward's laptop".
+    pub description: String,
     pub platform: String,
     pub zone: String,
     pub disabled: bool,
@@ -70,6 +72,15 @@ pub fn valid_label(label: &str) -> bool {
         && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !label.starts_with('-')
         && !label.ends_with('-')
+}
+
+/// Longest description accepted, in characters.
+pub const DESCRIPTION_MAX: usize = 64;
+
+/// A description is optional free text: no control characters, and short
+/// enough to show in a list.
+pub fn valid_description(description: &str) -> bool {
+    description.chars().count() <= DESCRIPTION_MAX && !description.chars().any(char::is_control)
 }
 
 pub fn device_id(config: &Config, label: &str) -> String {
@@ -119,45 +130,59 @@ fn change_outcome(result: ldap3::result::Result<ldap3::LdapResult>, action: &str
 }
 
 pub fn list(config: &Config) -> Result<Vec<Device>, String> {
+    let mut devices = search(config, &config.ldap_devices_dn, Scope::OneLevel)?;
+    devices.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(devices)
+}
+
+/// Looks up one device; `None` if it is not registered.
+pub fn get(config: &Config, label: &str) -> Result<Option<Device>, String> {
+    Ok(search(config, &device_dn(config, label), Scope::Base)?.pop())
+}
+
+fn search(config: &Config, base: &str, scope: Scope) -> Result<Vec<Device>, String> {
     let mut ldap = connect(config)?;
 
     let result = ldap
         .with_timeout(TIMEOUT)
         .search(
-            &config.ldap_devices_dn,
-            Scope::OneLevel,
+            base,
+            scope,
             "(objectClass=managedDevice)",
-            vec!["deviceId", "deviceType", "deviceZone", "deviceDisabled"],
+            vec!["deviceId", "description", "deviceType", "deviceZone", "deviceDisabled"],
         )
-        .and_then(|result| result.success())
-        .map_err(|err| format!("device search failed: {err}"));
+        .and_then(|result| result.success());
 
     let _ = ldap.unbind();
-    let (entries, _) = result?;
+    let entries = match result {
+        Ok((entries, _)) => entries,
+        Err(LdapError::LdapResult { result }) if result.rc == NO_SUCH_OBJECT => Vec::new(),
+        Err(err) => return Err(format!("device search failed: {err}")),
+    };
 
-    let mut devices: Vec<Device> = entries
+    Ok(entries
         .into_iter()
         .map(SearchEntry::construct)
         .map(|entry| {
             let first = |name: &str| entry.attrs.get(name).and_then(|v| v.first()).cloned().unwrap_or_default();
             Device {
                 id: first("deviceId"),
+                description: first("description"),
                 platform: first("deviceType"),
                 zone: first("deviceZone"),
                 disabled: first("deviceDisabled").eq_ignore_ascii_case("TRUE"),
             }
         })
         .filter(|device| !device.id.is_empty())
-        .collect();
-
-    devices.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(devices)
+        .collect())
 }
 
-/// Creates an enabled device entry. The caller validates the label and zone.
+/// Creates an enabled device entry. The caller validates the label, zone
+/// and description; an empty description is not stored.
 pub fn register(
     config: &Config,
     label: &str,
+    description: &str,
     platform: Platform,
     zone: &str,
     owner: &str,
@@ -166,7 +191,7 @@ pub fn register(
     let dn = device_dn(config, label);
     let owner_dn = format!("uid={},{}", dn_escape(owner), config.ldap_people_dn);
 
-    let attrs = vec![
+    let mut attrs = vec![
         ("objectClass", HashSet::from(["device", "managedDevice"])),
         ("cn", HashSet::from([id.as_str()])),
         ("deviceId", HashSet::from([id.as_str()])),
@@ -175,6 +200,9 @@ pub fn register(
         ("deviceDisabled", HashSet::from(["FALSE"])),
         ("owner", HashSet::from([owner_dn.as_str()])),
     ];
+    if !description.is_empty() {
+        attrs.push(("description", HashSet::from([description])));
+    }
 
     let mut ldap = connect(config)?;
     let result = ldap.with_timeout(TIMEOUT).add(&dn, attrs);
@@ -218,6 +246,16 @@ mod tests {
         for label in ["", "-a", "a-", "Laptop", "a.b", "a_b", "a b", &"a".repeat(64)] {
             assert!(!valid_label(label), "{label:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn validates_descriptions() {
+        assert!(valid_description(""));
+        assert!(valid_description("Edward\u{2019}s laptop"));
+        assert!(valid_description(&"é".repeat(DESCRIPTION_MAX)));
+        assert!(!valid_description(&"a".repeat(DESCRIPTION_MAX + 1)));
+        assert!(!valid_description("line\nbreak"));
+        assert!(!valid_description("tab\there"));
     }
 
     #[test]

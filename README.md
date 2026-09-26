@@ -66,14 +66,31 @@ enables it explicitly.
 * Revocation: set `deviceDisabled` in LDAP (effective at the next
   association). Revoking in step-ca additionally blocks renewal.
 
+## Pages
+
+* **Enrol a device** (`/enrol`): a stepped flow, Sign in → Device → Enrol
+  → Connect. The Device step registers the device; the Enrol step
+  (`/enrol/device`) will deliver the enrolment material.
+* **Devices** (`/devices`): every registered device, with disable, enable
+  and delete.
+* Pages use IBM Plex Mono (SIL Open Font License, see
+  `src/assets/fonts/LICENSE.txt`) and a halftone background, all embedded
+  in the binary. The Content Security Policy allows only same-origin
+  scripts, styles, fonts and images.
+* JavaScript is optional. When present it preselects the device type from
+  the browser and shows the matching illustration and naming tip. Browsers
+  do not expose the computer's name, so the name is typed.
+
 ## Device registration
 
 * A signed-in enroller enters a device name (one DNS label, lowercased),
-  a platform (Windows, Linux or iOS) and a network zone from
+  an optional description (up to 64 characters, stored in `description`),
+  a device type (Windows, Linux or iPhone / iPad) and a network zone from
   `CERT_ENROLMENT_DEVICE_ZONES`.
 * The service account creates
   `cn=<label>.<device domain>,<devices DN>` with object classes `device`
-  and `managedDevice`: `deviceId` (same as the CN), `deviceType` (platform),
+  and `managedDevice`: `deviceId` (same as the CN), `description` (if
+  given), `deviceType` (platform),
   `deviceZone`, `deviceDisabled: FALSE`, and `owner` set to the enroller's
   DN for auditing.
 * Names that already exist are refused. All enrollers see every device.
