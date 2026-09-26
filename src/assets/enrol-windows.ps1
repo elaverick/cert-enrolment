@@ -61,6 +61,7 @@ function ConvertFrom-Pem([string] $Pem) {
 # certificate request for it. The request stays pending so that
 # certreq -accept can join the issued certificate to the key.
 function New-DeviceRequest([string] $DeviceId, [string] $Provider, [string] $WorkDir) {
+    Remove-PendingRequests -DeviceId $DeviceId
     $inf = Join-Path $WorkDir 'request.inf'
     $csr = Join-Path $WorkDir 'request.csr'
     @(
@@ -123,20 +124,36 @@ function Install-DeviceCertificate($Response, [string] $DeviceId, [string] $Work
 function Remove-OtherDeviceCertificates([string] $DeviceId, [string] $Keep) {
     Get-ChildItem Cert:\LocalMachine\My |
         Where-Object { $_.Subject -eq "CN=$DeviceId" -and $_.Thumbprint -ne $Keep } |
-        ForEach-Object {
-            $old = $_
-            try {
-                $key = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($old)
-                if ($key -is [System.Security.Cryptography.ECDsaCng]) { $key.Key.Delete() }
-            } catch {
-                # The certificate is removed even if its key cannot be.
-            }
-            Remove-Item -Path $old.PSPath
-        }
+        ForEach-Object { Remove-CertificateAndKey $_ }
 }
 
 function Get-StepCaError($ErrorRecord) {
     try { ($ErrorRecord.ErrorDetails.Message | ConvertFrom-Json).message } catch { $ErrorRecord.Exception.Message }
+}
+
+# True if the certificate authority answered, and so may have spent the
+# token; false if it could not be reached at all.
+function Test-CaAnswered($ErrorRecord) {
+    $response = $ErrorRecord.Exception.PSObject.Properties['Response']
+    [bool] ($response -and $response.Value)
+}
+
+# Removes pending certificate requests for this device, left by attempts
+# that never received a certificate, together with their keys.
+function Remove-PendingRequests([string] $DeviceId) {
+    Get-ChildItem Cert:\LocalMachine\REQUEST -ErrorAction SilentlyContinue |
+        Where-Object { $_.Subject -eq "CN=$DeviceId" } |
+        ForEach-Object { Remove-CertificateAndKey $_ }
+}
+
+function Remove-CertificateAndKey($Certificate) {
+    try {
+        $key = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($Certificate)
+        if ($key -is [System.Security.Cryptography.ECDsaCng]) { $key.Key.Delete() }
+    } catch {
+        # The certificate is removed even if its key cannot be.
+    }
+    Remove-Item -Path $Certificate.PSPath
 }
 '@
 . ([ScriptBlock]::Create($Common))
@@ -153,6 +170,15 @@ if ($build -lt 22621) {
 }
 
 Enable-ModernTls
+
+# Check the certificate authority can be found before changing anything.
+$caHost = ([Uri] $CaUrl).Host
+try {
+    [Net.Dns]::GetHostAddresses($caHost) | Out-Null
+} catch {
+    throw "This computer cannot resolve $caHost, so it cannot reach the certificate authority. Nothing has been changed. Check this computer's DNS settings, then run the script again; the enrolment token stays usable until ten minutes after download."
+}
+
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 $work = Join-Path $env:TEMP ('cert-enrolment-' + [Guid]::NewGuid())
 New-Item -ItemType Directory -Path $work | Out-Null
@@ -175,6 +201,13 @@ try {
     }
     Set-Content -Path (Join-Path $StateDir 'root-ca.crt') -Value $RootCaPem -Encoding ASCII
 
+    # Now that the Root CA is trusted, check the CA answers over TLS.
+    try {
+        Invoke-RestMethod -Uri "$CaUrl/health" -UseBasicParsing | Out-Null
+    } catch {
+        throw "Could not reach the certificate authority at ${CaUrl}: $($_.Exception.Message) The enrolment token has not been used; run the script again within ten minutes of downloading it."
+    }
+
     # 2. Key and certificate request -----------------------------------------
     Write-Step 'Creating the device key in the TPM'
     try {
@@ -193,7 +226,11 @@ try {
     try {
         $response = Invoke-RestMethod -Method Post -Uri "$CaUrl/1.0/sign" -ContentType 'application/json' -Body $body -UseBasicParsing
     } catch {
-        throw "The certificate authority refused the request: $(Get-StepCaError $_) Enrolment tokens work once and expire ten minutes after download; download a new script if needed."
+        Remove-PendingRequests -DeviceId $DeviceId
+        if (Test-CaAnswered $_) {
+            throw "The certificate authority refused the request: $(Get-StepCaError $_) Enrolment tokens work once and expire ten minutes after download; download a new script from the Enrol page."
+        }
+        throw "Could not reach the certificate authority at ${CaUrl}: $($_.Exception.Message) The enrolment token has not been used; run the script again within ten minutes of downloading it."
     }
     $certificate = Install-DeviceCertificate -Response $response -DeviceId $DeviceId -WorkDir $work
     Remove-OtherDeviceCertificates -DeviceId $DeviceId -Keep $certificate.Thumbprint
@@ -324,7 +361,9 @@ try {
         try {
             $response = Invoke-RestMethod -Method Post -Uri "$CaUrl/1.0/rekey" -Certificate $current -ContentType 'application/json' -Body $body -UseBasicParsing
         } catch {
-            throw "The certificate authority refused renewal: $(Get-StepCaError $_)"
+            Remove-PendingRequests -DeviceId $DeviceId
+            if (Test-CaAnswered $_) { throw "The certificate authority refused renewal: $(Get-StepCaError $_)" }
+            throw "Could not reach the certificate authority at ${CaUrl}: $($_.Exception.Message) Will retry at the next check."
         }
         $renewed = Install-DeviceCertificate -Response $response -DeviceId $DeviceId -WorkDir $work
         Remove-OtherDeviceCertificates -DeviceId $DeviceId -Keep $renewed.Thumbprint

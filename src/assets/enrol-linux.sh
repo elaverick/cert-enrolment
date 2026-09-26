@@ -36,6 +36,13 @@ for tool in curl openssl sed; do
     command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
 done
 
+# Check the certificate authority can be found before changing anything.
+ca_host=${CA_URL#https://}
+ca_host=${ca_host%%:*}
+if command -v getent >/dev/null 2>&1 && ! getent hosts "$ca_host" >/dev/null 2>&1; then
+    fail "this computer cannot resolve $ca_host, so it cannot reach the certificate authority. Nothing has been changed. Check this computer's DNS settings, then run the script again; the enrolment token stays usable until ten minutes after download."
+fi
+
 umask 077
 mkdir -p "$DIR"
 chmod 700 "$DIR"
@@ -106,14 +113,20 @@ openssl req -new -key "$work/key.pem" -subj "/CN=$DEVICE_ID" \
 if [ -n "$token" ]; then
     printf '{"csr":"%s","ott":"%s"}' "$(json_pem "$work/request.csr")" "$token" > "$work/request.json"
     status=$(curl -sS -o "$work/response.json" -w '%{http_code}' --cacert "$DIR/root-ca.crt" \
-        -H 'Content-Type: application/json' --data @"$work/request.json" "$CA_URL/1.0/sign")
+        -H 'Content-Type: application/json' --data @"$work/request.json" "$CA_URL/1.0/sign") || status=unreachable
 else
     printf '{"csr":"%s"}' "$(json_pem "$work/request.csr")" > "$work/request.json"
     status=$(curl -sS -o "$work/response.json" -w '%{http_code}' --cacert "$DIR/root-ca.crt" \
         --cert "$DIR/cert.pem" --key "$DIR/key.pem" \
-        -H 'Content-Type: application/json' --data @"$work/request.json" "$CA_URL/1.0/rekey")
+        -H 'Content-Type: application/json' --data @"$work/request.json" "$CA_URL/1.0/rekey") || status=unreachable
 fi
 
+# Exit status 2 means the certificate authority could not be reached, so an
+# enrolment token has not been used.
+if [ "$status" = unreachable ] || [ "$status" = 000 ]; then
+    log "Could not reach the certificate authority at $CA_URL."
+    exit 2
+fi
 if [ "$status" != 201 ]; then
     log "The certificate authority refused the request (HTTP $status): $(json_field message "$work/response.json")"
     exit 1
@@ -138,7 +151,13 @@ SETTINGS
 
 # 2 and 3. Key and certificate ----------------------------------------------------
 step "Requesting a certificate for $DEVICE_ID"
-"$RENEW" --token "$TOKEN" || fail "enrolment failed. Enrolment tokens work once and expire ten minutes after download; download a new script if needed."
+status=0
+"$RENEW" --token "$TOKEN" || status=$?
+if [ "$status" -eq 2 ]; then
+    fail "the enrolment token has not been used; check that this computer can reach $CA_URL, then run the script again within ten minutes of downloading it."
+elif [ "$status" -ne 0 ]; then
+    fail "enrolment failed. Enrolment tokens work once and expire ten minutes after download; download a new script from the Enrol page."
+fi
 
 # 4. Wi-Fi profile ----------------------------------------------------------------
 if command -v nmcli >/dev/null 2>&1; then
