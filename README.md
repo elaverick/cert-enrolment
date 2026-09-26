@@ -323,7 +323,7 @@ request.
 * [x] Reference deployment (homelab role, NGINX site and certificate)
 * [x] step-ca JWK provisioner and single-use token signing
 * [x] Linux enrolment script (tested end to end against step-ca, including renewal)
-* [x] Windows enrolment script (parsed by Windows PowerShell 5.1 and 7; not yet run on a real device)
+* [x] Windows enrolment script (enrolled a real Windows 11 device: TPM key, certificate, Wi-Fi profile and renewal task; first real renewal and Wi-Fi connection still to be observed)
 * [ ] Onboarding: HTTP bootstrap page with the Root CA, and captive-portal setup
 * [ ] step-ca SCEP provisioner and challenge webhook
 * [ ] iOS enrolment profile
