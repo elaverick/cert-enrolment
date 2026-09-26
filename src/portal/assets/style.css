@@ -26,6 +26,7 @@
   --accent-text: #ffffff;
   --error: #a4221a;
   --notice: #1f6f43;
+  --warning: #8a5a00;
   --danger: #a4221a;
   --danger-text: #ffffff;
   --background: url("/background-light.svg");
@@ -44,6 +45,7 @@
     --accent-text: #15191b;
     --error: #f28b82;
     --notice: #7bd3a0;
+    --warning: #f2c46d;
     --danger: #f28b82;
     --danger-text: #15191b;
     --background: url("/background-dark.svg");
@@ -232,7 +234,7 @@ button {
   cursor: pointer;
 }
 
-button.block {
+button.block, a.button.block {
   display: flex;
   justify-content: center;
   align-items: center;
@@ -245,6 +247,8 @@ a.button {
   margin-top: 1.5rem;
   padding: 0.65rem 1.2rem;
   font-weight: 600;
+  color: var(--accent-text);
+  background: var(--accent);
   text-decoration: none;
   border: 1px solid transparent;
   border-radius: 6px;
@@ -317,11 +321,27 @@ td .detail { display: block; color: var(--muted); font-size: 0.78rem; }
 td:first-child { overflow-wrap: anywhere; }
 
 .status-disabled { color: var(--error); }
+.status-warning { color: var(--warning); font-weight: 600; }
+.status-expired { color: var(--error); font-weight: 600; }
 
 .actions { white-space: nowrap; text-align: right; }
 .actions form { display: inline; }
 .actions > * + * { margin-left: 0.35rem; }
 a.button.small { margin: 0; padding: 0.2rem 0.55rem; font-size: 0.8rem; }
+
+/* Onboarding */
+
+code.fingerprint { font-size: 0.8rem; word-spacing: -0.15em; }
+
+details.platform { margin-top: 1rem; border: 1px solid var(--border); border-radius: 6px; }
+details.platform > summary { padding: 0.65rem 1rem; font-weight: 600; cursor: pointer; }
+details.platform[open] > summary { border-bottom: 1px solid var(--border); }
+details.platform > :not(summary) { margin-left: 1rem; margin-right: 1rem; }
+details.platform > :last-child { margin-bottom: 1rem; }
+details.platform a.button { margin-top: 1rem; width: auto; }
+details.platform p, ol.instructions { font-size: 0.9rem; }
+ol.instructions { padding-left: 1.25rem; }
+ol.instructions li + li { margin-top: 0.4rem; }
 
 pre.command {
   margin: 0.75rem 0;

@@ -2,6 +2,7 @@
 
 use crate::shared::device::{Device, Platform, DESCRIPTION_MAX};
 use crate::shared::http::escape;
+use crate::shared::time::parse_generalized_time;
 
 const LAYOUT: &str = include_str!("assets/layout.html");
 
@@ -285,7 +286,49 @@ fn script_instructions(device: &Device, csrf_token: &str, before: &str, command:
     )
 }
 
-pub fn devices(devices: &[Device], csrf_token: &str, notice: Option<&str>, error: Option<&str>) -> String {
+/// Devices renew once two thirds of a certificate's life has passed, ten days
+/// before expiry for a 30-day certificate, and try daily. A certificate this
+/// close to expiry has missed several renewals.
+const EXPIRY_WARNING_DAYS: i64 = 7;
+
+/// The Certificate cell: when the newest certificate expires, flagged once
+/// renewal looks to have stopped. `now` is seconds since the Unix epoch.
+fn certificate_status(expires: Option<&str>, now: i64) -> String {
+    let Some((text, unix)) = expires.and_then(|text| Some((text, parse_generalized_time(text)?))) else {
+        return r#"<span class="muted">Not enrolled</span>"#.to_string();
+    };
+
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let month = MONTHS[text[4..6].parse::<usize>().unwrap_or(1) - 1];
+    let date = format!(
+        r#"<time datetime="{}-{}-{}T{}:{}:{}Z">{} {month} {}</time>"#,
+        &text[0..4],
+        &text[4..6],
+        &text[6..8],
+        &text[8..10],
+        &text[10..12],
+        &text[12..14],
+        text[6..8].trim_start_matches('0'),
+        &text[0..4],
+    );
+
+    if unix <= now {
+        return format!(r#"<span class="status-expired">Expired {date}</span><span class="detail">Enrol the device again.</span>"#);
+    }
+    let days = (unix - now) / 86_400;
+    let remaining = match days {
+        0 => "today".to_string(),
+        1 => "tomorrow".to_string(),
+        days => format!("in {days} days"),
+    };
+    if days < EXPIRY_WARNING_DAYS {
+        format!(r#"<span class="status-warning">Expires {date}</span><span class="detail">{remaining}, renewal overdue</span>"#)
+    } else {
+        format!(r#"Expires {date}<span class="detail">{remaining}</span>"#)
+    }
+}
+
+pub fn devices(devices: &[Device], csrf_token: &str, now: i64, notice: Option<&str>, error: Option<&str>) -> String {
     let rows: String = devices
         .iter()
         .map(|device| {
@@ -300,11 +343,12 @@ pub fn devices(devices: &[Device], csrf_token: &str, notice: Option<&str>, error
                 format!(r#"<span class="detail">{}</span>"#, escape(&device.description))
             };
             format!(
-                r#"<tr><td>{id}{description}</td><td data-label="Type">{platform}</td><td data-label="Zone">{zone}</td><td data-label="Status">{status}</td><td class="actions">{enrol}{toggle}{delete}</td></tr>
+                r#"<tr><td>{id}{description}</td><td data-label="Type">{platform}</td><td data-label="Zone">{zone}</td><td data-label="Status">{status}</td><td data-label="Certificate">{certificate}</td><td class="actions">{enrol}{toggle}{delete}</td></tr>
 "#,
                 id = escape(&device.id),
                 platform = escape(platform_label(&device.platform)),
                 zone = escape(&device.zone),
+                certificate = certificate_status(device.certificate_expires.as_deref(), now),
                 enrol = if device.disabled || device.label.is_empty() {
                     String::new()
                 } else {
@@ -325,7 +369,7 @@ pub fn devices(devices: &[Device], csrf_token: &str, notice: Option<&str>, error
     } else {
         format!(
             r#"<div class="table-wrap"><table>
-<thead><tr><th scope="col">Device</th><th scope="col">Type</th><th scope="col">Zone</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead>
+<thead><tr><th scope="col">Device</th><th scope="col">Type</th><th scope="col">Zone</th><th scope="col">Status</th><th scope="col">Certificate</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead>
 <tbody>
 {rows}</tbody>
 </table></div>"#
@@ -387,6 +431,73 @@ pub fn confirm_delete(id: &str, csrf_token: &str) -> String {
     })
 }
 
+/// The plain-HTTP onboarding page: trust the Root CA, then continue to the
+/// portal over HTTPS. One section per platform; the page script opens the
+/// one for this device.
+pub fn onboarding(common_name: &str, fingerprint: &str, public_url: &str) -> String {
+    let name = escape(common_name);
+    let host = public_url.trim_start_matches("https://");
+
+    render(Page {
+        title: "Set up this device",
+        subtitle: "Trust this network’s certificate authority, then enrol the device for the trusted Wi-Fi.",
+        nav: String::new(),
+        wide: false,
+        content: format!(
+            r#"<section class="card" aria-labelledby="trust">
+<h2 id="trust">1. Trust the Root CA</h2>
+<p class="muted">The enrolment site uses a certificate from this network’s own certificate authority. Install its Root CA on this device first.</p>
+<dl class="summary">
+<dt>Root CA</dt><dd>{name}</dd>
+<dt>SHA-256</dt><dd><code class="fingerprint">{fingerprint}</code></dd>
+</dl>
+<p class="hint">This page is not encrypted. If in doubt, compare the fingerprint with one from someone you trust before installing.</p>
+
+<details class="platform" data-platform="windows" open>
+<summary>Windows</summary>
+<a href="/root-ca.cer" class="button block" download>Download the Root CA</a>
+<p>Open PowerShell as administrator in the folder you saved it to, and run:</p>
+<pre class="command"><code>certutil -addstore Root .\root-ca.cer</code></pre>
+<p class="muted">To check it first, <code>Get-FileHash .\root-ca.cer</code> shows the same fingerprint without spaces.</p>
+</details>
+
+<details class="platform" data-platform="ios" open>
+<summary>iPhone / iPad</summary>
+<p>Profiles cannot be installed from a Wi-Fi sign-in window. If this page opened in one, tap Cancel, choose to use the network without internet, then open <strong>Safari</strong> and go to <code>http://{host}/</code>.</p>
+<a href="/root-ca.mobileconfig" class="button block">Download the profile</a>
+<ol class="instructions">
+<li>Open Settings › Profile Downloaded, and install it. Its details show the fingerprint.</li>
+<li>Go to Settings › General › About › Certificate Trust Settings, and turn on full trust for <strong>{name}</strong>.</li>
+</ol>
+<p class="muted">Enrolment for iPhone and iPad is not available yet.</p>
+</details>
+
+<details class="platform" data-platform="linux" open>
+<summary>Linux</summary>
+<a href="/root-ca.crt" class="button block" download>Download the Root CA</a>
+<p>From the folder you saved it to, on Debian or Ubuntu:</p>
+<pre class="command"><code>sudo cp root-ca.crt /usr/local/share/ca-certificates/cert-enrolment-root-ca.crt
+sudo update-ca-certificates</code></pre>
+<p>On Fedora:</p>
+<pre class="command"><code>sudo cp root-ca.crt /etc/pki/ca-trust/source/anchors/cert-enrolment-root-ca.crt
+sudo update-ca-trust</code></pre>
+<p class="muted">To check it first, <code>openssl x509 -in root-ca.crt -noout -fingerprint -sha256</code>. Firefox keeps its own list: import it under Settings › Privacy &amp; Security › Certificates.</p>
+</details>
+</section>
+
+<section class="card" aria-labelledby="continue">
+<h2 id="continue">2. Continue to enrolment</h2>
+<p class="muted">Sign in over HTTPS to register and enrol this device. If your browser warns about the site’s certificate, the Root CA is not trusted yet.</p>
+<a href="{url}/" class="button block">Continue to {host} {arrow}</a>
+</section>"#,
+            fingerprint = escape(fingerprint),
+            host = escape(host),
+            url = escape(public_url),
+            arrow = ARROW,
+        ),
+    })
+}
+
 pub fn unavailable() -> String {
     render(Page {
         title: "Directory unavailable",
@@ -413,3 +524,30 @@ const PHONE_ILLUSTRATION: &str = r#"<svg data-illustration="phone" viewBox="0 0 
 <rect x="67" y="18" width="46" height="94" rx="3" fill="none" stroke="currentColor" stroke-width="1" opacity=".5"/>
 <path d="M82 12h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
 </svg>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 2026-09-26T12:00:00Z
+    const NOW: i64 = 1_790_424_000;
+
+    #[test]
+    fn certificate_status_reports_expiry() {
+        assert!(certificate_status(None, NOW).contains("Not enrolled"));
+        assert!(certificate_status(Some("garbage"), NOW).contains("Not enrolled"));
+
+        let valid = certificate_status(Some("20261026185120Z"), NOW);
+        assert!(valid.contains(r#"<time datetime="2026-10-26T18:51:20Z">26 Oct 2026</time>"#), "{valid}");
+        assert!(valid.contains("in 30 days"));
+        assert!(!valid.contains("status-"));
+
+        let soon = certificate_status(Some("20261001120000Z"), NOW);
+        assert!(soon.contains("status-warning") && soon.contains("in 5 days"), "{soon}");
+        assert!(certificate_status(Some("20260927130000Z"), NOW).contains("tomorrow"));
+        assert!(certificate_status(Some("20260926130000Z"), NOW).contains("today"));
+
+        let expired = certificate_status(Some("20260901090000Z"), NOW);
+        assert!(expired.contains("status-expired") && expired.contains("1 Sep 2026"), "{expired}");
+    }
+}

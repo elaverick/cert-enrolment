@@ -21,7 +21,6 @@ mod stepca;
 mod token;
 
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use tiny_http::{Method, Request, Server};
@@ -29,6 +28,7 @@ use tiny_http::{Method, Request, Server};
 use crate::shared::device::{device_id, label_from_id, valid_description, valid_label, Platform};
 use crate::shared::http::{self, json_error, Reply};
 use crate::shared::random::tokens_match;
+use crate::shared::time;
 use crate::shared::user::valid_username;
 use codes::Codes;
 use config::Config;
@@ -128,8 +128,7 @@ fn unavailable(err: &str) -> Reply {
 }
 
 fn now() -> String {
-    let unix = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    certs::generalized_time(unix).unwrap_or_default()
+    time::generalized_time(time::now_unix()).unwrap_or_default()
 }
 
 /// Looks up a device named by a validated label, answering 404 if it is not

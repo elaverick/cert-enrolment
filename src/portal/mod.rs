@@ -2,22 +2,27 @@
 //! managing them.
 //!
 //! Plain HTTP only: a reverse proxy terminates TLS for the portal host name.
+//! Optionally, a second listener serves the onboarding site, which is meant
+//! to be reached over plain HTTP.
 
 mod assets;
 mod config;
 mod directory;
 mod enrolment;
+mod onboarding;
 mod pages;
 mod ra_client;
 mod session;
 
 use std::process::ExitCode;
+use std::thread;
 
 use tiny_http::{Method, Request, Server};
 
 use crate::shared::device::{device_id, label_from_id, valid_description, valid_label, Platform};
 use crate::shared::http::{self, Reply, LOGIN_CSRF_COOKIE, SESSION_COOKIE};
 use crate::shared::random::{random_token, tokens_match};
+use crate::shared::time;
 use config::Config;
 use directory::SignIn;
 use ra_client::{RaClient, RaError};
@@ -43,6 +48,24 @@ pub fn run() -> ExitCode {
     };
 
     eprintln!("cert-enrolment: listening on {}", config.listen);
+
+    if let Some(settings) = &config.onboarding {
+        let started = onboarding::Onboarding::new(&config.root_ca_pem, &settings.public_url).and_then(|site| {
+            let server = Server::http(&settings.listen)
+                .map_err(|err| format!("cannot listen on {} for onboarding: {err}", settings.listen))?;
+            Ok((site, server))
+        });
+        match started {
+            Ok((site, server)) => {
+                eprintln!("cert-enrolment: onboarding site listening on {}", settings.listen);
+                thread::spawn(move || onboarding::serve(server, site));
+            }
+            Err(err) => {
+                eprintln!("cert-enrolment: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let mut sessions = Sessions::new(config.session_idle);
 
@@ -297,7 +320,7 @@ fn device_list(config: &Config, ra: &RaClient, sessions: &mut Sessions, request:
 
 fn device_list_page(ra: &RaClient, user: &SignedIn, status: u16, notice: Option<&str>, error: Option<&str>) -> Reply {
     match ra.list(&user.username) {
-        Ok(device_list) => http::html(status, pages::devices(&device_list, &user.csrf_token, notice, error)),
+        Ok(device_list) => http::html(status, pages::devices(&device_list, &user.csrf_token, time::now_unix(), notice, error)),
         Err(err) => ra_unavailable(err),
     }
 }

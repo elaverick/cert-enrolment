@@ -41,6 +41,14 @@ pub struct Config {
     pub root_ca_pem: String,
     /// Sessions expire after this long without a request.
     pub session_idle: Duration,
+    /// Where to serve the plain-HTTP onboarding site, if at all, and the
+    /// portal's own HTTPS address, which it sends people on to.
+    pub onboarding: Option<OnboardingConfig>,
+}
+
+pub struct OnboardingConfig {
+    pub listen: String,
+    pub public_url: String,
 }
 
 impl Config {
@@ -85,6 +93,17 @@ impl Config {
             .or_else(|_| env::var("SSL_CERT_FILE"))
             .map_err(|_| "CERT_ENROLMENT_ROOT_CA_FILE or SSL_CERT_FILE must be set")?;
 
+        let onboarding = match env::var("CERT_ENROLMENT_ONBOARDING_LISTEN") {
+            Ok(listen) if !listen.trim().is_empty() => {
+                let public_url = required("CERT_ENROLMENT_PUBLIC_URL")?.trim_end_matches('/').to_string();
+                if !valid_ca_url(&public_url) {
+                    return Err("CERT_ENROLMENT_PUBLIC_URL must be an https:// URL with a host name and optional port".to_string());
+                }
+                Some(OnboardingConfig { listen, public_url })
+            }
+            _ => None,
+        };
+
         Ok(Config {
             listen: listen_address("0.0.0.0:8080"),
             ldap_url,
@@ -99,6 +118,7 @@ impl Config {
             radius_server_name,
             root_ca_pem: certificate_file(&root_ca_file)?,
             session_idle: Duration::from_secs(session_minutes * 60),
+            onboarding,
         })
     }
 }

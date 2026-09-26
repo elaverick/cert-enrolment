@@ -161,10 +161,9 @@ pub fn no_content() -> Reply {
     secure(Response::from_string("").with_status_code(204))
 }
 
-/// A generated file offered for saving. It may hold a credential, so it is
-/// never cached.
-pub fn download(file_name: &str, content_type: &str, body: String) -> Reply {
-    secure(Response::from_string(body))
+/// A file offered for saving. Some hold a credential, so none are cached.
+pub fn download(file_name: &str, content_type: &str, body: impl Into<Vec<u8>>) -> Reply {
+    secure(Response::from_data(body))
         .with_header(raw_header("Content-Type", content_type))
         .with_header(raw_header("Content-Disposition", &format!("attachment; filename=\"{file_name}\"")))
 }

@@ -121,6 +121,7 @@ dependencies = [
  "ldap3",
  "p256",
  "serde_json",
+ "sha2",
  "tiny_http",
  "ureq",
  "x509-parser",
