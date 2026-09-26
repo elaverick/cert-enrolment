@@ -6,8 +6,8 @@
 //! and the Root CA all have restricted formats), and is also quoted for the
 //! script language, so no value can change the script's meaning.
 
-use crate::config::Config;
-use crate::devices::Platform;
+use super::config::Config;
+use super::devices::Platform;
 
 const WINDOWS: &str = include_str!("assets/enrol-windows.ps1");
 const LINUX: &str = include_str!("assets/enrol-linux.sh");

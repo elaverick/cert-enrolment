@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ldap3::{dn_escape, ldap_escape, LdapConn, LdapConnSettings, LdapError, Scope};
 
-use crate::config::Config;
+use super::config::Config;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 

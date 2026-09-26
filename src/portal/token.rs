@@ -14,7 +14,7 @@ use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use serde_json::{json, Value};
 
-use crate::session::random_token;
+use crate::shared::random::random_token;
 
 pub struct Provisioner {
     /// Provisioner name, the token issuer.

@@ -1,6 +1,6 @@
 //! Static files embedded in the binary.
 
-use crate::http::{self, Reply};
+use crate::shared::http::{self, Reply};
 
 const STYLE: &str = include_str!("assets/style.css");
 const SCRIPT: &str = include_str!("assets/app.js");
