@@ -79,13 +79,13 @@ mod tests {
 
     #[test]
     fn accepts_ordinary_uids() {
-        assert!(valid_username("elaverick"));
-        assert!(valid_username("t.laverick-2"));
+        assert!(valid_username("alice"));
+        assert!(valid_username("b.smith-2"));
     }
 
     #[test]
     fn rejects_unsafe_or_empty_uids() {
-        for name in ["", "-x", ".x", "Elaverick", "a,b", "a)(uid=*", "a b", "é", &"a".repeat(65)] {
+        for name in ["", "-x", ".x", "Alice", "a,b", "a)(uid=*", "a b", "é", &"a".repeat(65)] {
             assert!(!valid_username(name), "{name:?} should be rejected");
         }
     }

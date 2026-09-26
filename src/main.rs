@@ -1,4 +1,4 @@
-//! cert-enrolment - device certificate enrolment service for the homelab Wi-Fi.
+//! cert-enrolment - device certificate enrolment for an 802.1X (EAP-TLS) Wi-Fi network.
 //!
 //! Plain HTTP only: NGINX terminates TLS for join.<domain> in front of it.
 

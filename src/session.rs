@@ -104,13 +104,13 @@ mod tests {
     #[test]
     fn idle_sessions_expire_and_removed_sessions_end() {
         let mut sessions = Sessions::new(Duration::from_millis(50));
-        let token = sessions.create("elaverick").unwrap();
-        assert_eq!(sessions.get(&token).unwrap().username, "elaverick");
+        let token = sessions.create("alice").unwrap();
+        assert_eq!(sessions.get(&token).unwrap().username, "alice");
 
         sessions.remove(&token);
         assert!(sessions.get(&token).is_none());
 
-        let token = sessions.create("elaverick").unwrap();
+        let token = sessions.create("alice").unwrap();
         std::thread::sleep(Duration::from_millis(80));
         assert!(sessions.get(&token).is_none());
     }

@@ -260,15 +260,15 @@ mod tests {
 
     #[test]
     fn extracts_labels_from_device_ids() {
-        let domain = "device.laverick.home.arpa";
-        assert_eq!(label_from_id(domain, "ed-laptop.device.laverick.home.arpa"), Some("ed-laptop"));
+        let domain = "device.example.home.arpa";
+        assert_eq!(label_from_id(domain, "ed-laptop.device.example.home.arpa"), Some("ed-laptop"));
         for id in [
-            "device.laverick.home.arpa",
-            ".device.laverick.home.arpa",
-            "a.b.device.laverick.home.arpa",
-            "ed-laptopdevice.laverick.home.arpa",
+            "device.example.home.arpa",
+            ".device.example.home.arpa",
+            "a.b.device.example.home.arpa",
+            "ed-laptopdevice.example.home.arpa",
             "ed-laptop.other.home.arpa",
-            "Ed.device.laverick.home.arpa",
+            "Ed.device.example.home.arpa",
         ] {
             assert_eq!(label_from_id(domain, id), None, "{id:?} should be rejected");
         }
