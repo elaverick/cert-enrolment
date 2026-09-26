@@ -66,6 +66,19 @@ enables it explicitly.
 * Revocation: set `deviceDisabled` in LDAP (effective at the next
   association). Revoking in step-ca additionally blocks renewal.
 
+## Device registration
+
+* A signed-in enroller enters a device name (one DNS label, lowercased),
+  a platform (Windows, Linux or iOS) and a network zone from
+  `CERT_ENROLMENT_DEVICE_ZONES`.
+* The service account creates
+  `cn=<label>.<device domain>,<devices DN>` with object classes `device`
+  and `managedDevice`: `deviceId` (same as the CN), `deviceType` (platform),
+  `deviceZone`, `deviceDisabled: FALSE`, and `owner` set to the enroller's
+  DN for auditing.
+* Names that already exist are refused. All enrollers see every device.
+* Registrations are logged with the enroller, device, platform and zone.
+
 ## Dependencies
 
 Agreed set, each added with the feature that needs it:
@@ -104,6 +117,11 @@ and `secret-scan.yaml` runs Gitleaks on every push and pull request.
 | `CERT_ENROLMENT_LDAP_URL` | required | LDAP server; must be `ldaps://` |
 | `CERT_ENROLMENT_LDAP_PEOPLE_DN` | required | Users sign in as `uid=<name>,<this DN>` |
 | `CERT_ENROLMENT_LDAP_ENROLLERS_GROUP_DN` | required | `posixGroup` whose `memberUid` values may sign in |
+| `CERT_ENROLMENT_LDAP_BIND_DN` | required | Service account for reading and writing device entries |
+| `CERT_ENROLMENT_LDAP_BIND_PASSWORD_FILE` | required | File holding the service account password (a Podman secret) |
+| `CERT_ENROLMENT_LDAP_DEVICES_DN` | required | Container of device entries, e.g. `ou=Devices,dc=...` |
+| `CERT_ENROLMENT_DEVICE_DOMAIN` | required | Device identities are `<label>.<this domain>` |
+| `CERT_ENROLMENT_DEVICE_ZONES` | required | Comma-separated zones offered at registration; the first is the default. Must match the FreeRADIUS zone map |
 | `CERT_ENROLMENT_SESSION_MINUTES` | `30` | Idle time before a session expires |
 | `SSL_CERT_FILE` | none | PEM file of CAs trusted for LDAPS. Set it to the homelab Root CA; the image has no other trust store |
 
@@ -129,7 +147,8 @@ and `secret-scan.yaml` runs Gitleaks on every push and pull request.
 
 * [x] Service skeleton, container image and CI
 * [x] LDAP sign-in restricted to `device-enrollers`
-* [ ] Device registration in `ou=Devices`
+* [x] Device registration in `ou=Devices`
+* [ ] Disable, enable and delete devices
 * [ ] step-ca JWK provisioner and single-use token signing
 * [ ] Windows enrolment script
 * [ ] Linux enrolment script

@@ -63,6 +63,19 @@ fn percent_decode(input: &str) -> Result<String, ()> {
     String::from_utf8(bytes).map_err(|_| ())
 }
 
+/// Reads a query string parameter. Values are used only after validation,
+/// so percent-encoded values are not decoded.
+pub fn query_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+    request
+        .url()
+        .split_once('?')?
+        .1
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(field, _)| *field == name)
+        .map(|(_, value)| value)
+}
+
 pub fn header<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
     request
         .headers()
