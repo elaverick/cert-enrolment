@@ -13,7 +13,6 @@ base64 = "0.23"
 serde_json = "1"
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 x509-parser = "0.18"
-sha2 = "0.11"
 
 [[bin]]
 name = "cert-enrolment"

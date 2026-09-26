@@ -11,8 +11,38 @@ pub type Reply = Response<Cursor<Vec<u8>>>;
 /// smaller.
 const MAX_BODY: u64 = 16 * 1024;
 
-pub const SESSION_COOKIE: &str = "__Host-session";
-pub const LOGIN_CSRF_COOKIE: &str = "__Host-login-csrf";
+/// Cookie names and attributes for one listener. All are host-only, hidden
+/// from scripts and never sent on cross-site requests.
+#[derive(Clone, Copy)]
+pub struct Cookies {
+    pub session: &'static str,
+    pub login_csrf: &'static str,
+    secure: bool,
+}
+
+/// Behind the TLS proxy: HTTPS-only, enforced by the `__Host-` prefix.
+pub const HTTPS_COOKIES: Cookies =
+    Cookies { session: "__Host-session", login_csrf: "__Host-login-csrf", secure: true };
+
+/// The onboarding listener, reached over plain HTTP, where browsers refuse
+/// `Secure` cookies. Different names keep them apart from the HTTPS ones.
+pub const ONBOARDING_COOKIES: Cookies =
+    Cookies { session: "onboarding-session", login_csrf: "onboarding-login-csrf", secure: false };
+
+impl Cookies {
+    pub fn set(&self, name: &str, value: &str) -> Header {
+        self.header(name, value, "")
+    }
+
+    pub fn clear(&self, name: &str) -> Header {
+        self.header(name, "", "; Max-Age=0")
+    }
+
+    fn header(&self, name: &str, value: &str, extra: &str) -> Header {
+        let secure = if self.secure { "; Secure" } else { "" };
+        raw_header("Set-Cookie", &format!("{name}={value}; Path=/{secure}; HttpOnly; SameSite=Strict{extra}"))
+    }
+}
 
 /// Reads an application/x-www-form-urlencoded body into name/value pairs.
 pub fn read_form(request: &mut Request) -> Result<Vec<(String, String)>, ()> {
@@ -113,21 +143,6 @@ pub fn cookie<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value)
 }
 
-/// Cookies are host-only, HTTPS-only, hidden from scripts and never sent on
-/// cross-site requests.
-pub fn set_cookie(name: &str, value: &str) -> Header {
-    raw_header(
-        "Set-Cookie",
-        &format!("{name}={value}; Path=/; Secure; HttpOnly; SameSite=Strict"),
-    )
-}
-
-pub fn clear_cookie(name: &str) -> Header {
-    raw_header(
-        "Set-Cookie",
-        &format!("{name}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"),
-    )
-}
 
 pub fn html(status: u16, body: String) -> Reply {
     secure(Response::from_string(body).with_status_code(status))
@@ -212,6 +227,14 @@ pub fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookies_are_secure_only_behind_the_proxy() {
+        let https = HTTPS_COOKIES.set(HTTPS_COOKIES.session, "t").value.to_string();
+        assert_eq!(https, "__Host-session=t; Path=/; Secure; HttpOnly; SameSite=Strict");
+        let http = ONBOARDING_COOKIES.clear(ONBOARDING_COOKIES.session).value.to_string();
+        assert_eq!(http, "onboarding-session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    }
 
     #[test]
     fn decodes_form_encoding() {

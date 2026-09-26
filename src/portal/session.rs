@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::shared::http::Cookies;
 use crate::shared::random::random_token;
 
 /// Bounds memory use if something creates sessions in a loop.
@@ -19,14 +20,16 @@ pub struct Session {
     last_seen: Instant,
 }
 
+/// The sessions of one listener, and the cookies that carry them there.
 pub struct Sessions {
+    pub cookies: Cookies,
     idle: Duration,
     sessions: HashMap<String, Session>,
 }
 
 impl Sessions {
-    pub fn new(idle: Duration) -> Sessions {
-        Sessions { idle, sessions: HashMap::new() }
+    pub fn new(idle: Duration, cookies: Cookies) -> Sessions {
+        Sessions { cookies, idle, sessions: HashMap::new() }
     }
 
     /// Creates a session and returns its token.
@@ -73,7 +76,7 @@ mod tests {
 
     #[test]
     fn idle_sessions_expire_and_removed_sessions_end() {
-        let mut sessions = Sessions::new(Duration::from_millis(50));
+        let mut sessions = Sessions::new(Duration::from_millis(50), crate::shared::http::HTTPS_COOKIES);
         let token = sessions.create("alice").unwrap();
         assert_eq!(sessions.get(&token).unwrap().username, "alice");
 

@@ -60,7 +60,7 @@ choice; they are referred to here by role.
 | Role | Example name | Security | Who joins | VLAN |
 |---|---|---|---|---|
 | **Trusted** | `Home` | WPA3-Enterprise, EAP-TLS | Enrolled devices | Assigned per device by FreeRADIUS from `deviceZone` (for example `trusted`, `quarantine`) |
-| **Onboarding** | `Home-Setup` | Open, preferably Enhanced Open (OWE), with a captive portal | Devices being enrolled | A dedicated onboarding VLAN that can reach only DNS, the portal and the RA, never the internet |
+| **Onboarding** | `Home-Setup` | Enhanced Open (OWE), with a captive portal; never plain open | Devices being enrolled | A dedicated onboarding VLAN that can reach only DNS, the portal and the RA, never the internet |
 | **IoT** | `Home-IoT` | WPA2/WPA3-Personal | Devices that cannot do 802.1X | A lower-trust IoT VLAN |
 
 Why three and not one:
@@ -81,49 +81,45 @@ Why three and not one:
 1. The device joins the onboarding network. The access point's captive
    portal sends it to `http://join.<domain>/` (the portal host name is a
    deployment choice).
-2. That first page is served over **plain HTTP**, only on the onboarding
-   VLAN. Its sole purpose is to deliver the Root CA in the form the device
-   needs, with the Root CA's SHA-256 fingerprint shown for comparison:
-   * **Windows:** the certificate (DER), with install instructions.
-   * **iPhone / iPad:** a configuration profile containing the Root CA.
-     Captive-portal windows on iOS cannot install profiles, so the page
-     asks the user to continue in Safari. After installing, full trust is
-     enabled under Settings › General › About › Certificate Trust Settings.
-   * **Linux:** the certificate (PEM), with install commands for Debian
-     and Fedora families.
-3. The user continues to `https://join.<domain>/`, now trusted. Sign-in,
-   registration and the enrolment download all happen over HTTPS.
-4. The enrolment script obtains the device certificate from the RA and adds
-   a Wi-Fi profile for the trusted network, and the device moves to it.
+2. That is the portal itself, served over **plain HTTP** so that a device
+   which does not trust the Root CA yet can use it: the user signs in,
+   registers the device and downloads its enrolment script, all in the
+   captive-portal window or browser, with no separate step.
+3. The enrolment script installs the Root CA, obtains the device
+   certificate from the RA over HTTPS and adds a Wi-Fi profile for the
+   trusted network, and the device moves to it.
 
-The onboarding site is a separate listener in the portal role
-(`CERT_ENROLMENT_ONBOARDING_LISTEN`), not the portal's pages over HTTP. It
-answers only `GET` and `HEAD`, sets no cookies, and serves:
-
-| Path | Content |
-|---|---|
-| `/` | The onboarding page |
-| `/root-ca.cer` | Root CA, DER (`application/pkix-cert`) |
-| `/root-ca.crt` | Root CA, PEM |
-| `/root-ca.mobileconfig` | Unsigned iOS profile holding only the Root CA; its identifiers derive from the certificate |
-| `/healthz` | `ok` |
-
-Any other path redirects to `/`, since captive portals add their own paths
-and parameters. Sign-in, registration and downloads exist only on the
-portal's main listener, which the proxy serves over HTTPS.
+The plain-HTTP portal is a second listener in the portal role
+(`CERT_ENROLMENT_ONBOARDING_LISTEN`). It serves the same pages, with its
+own sessions and its own cookies (`onboarding-session`,
+`onboarding-login-csrf`: no `Secure`, since browsers refuse that over HTTP,
+but still `HttpOnly` and `SameSite=Strict`). A session started on one
+listener is never accepted on the other. Unknown `GET` paths redirect to
+`/`, since captive portals add their own paths and parameters.
 
 Captive-portal configuration: point the onboarding network's external portal
 at the HTTP address, and allow the portal and RA host names before
 authorisation. Nothing ever needs to be authorised to reach the internet.
+Serve the plain-HTTP portal only to the onboarding VLAN; other networks use
+HTTPS.
 
-**Accepted risk.** The Root CA is delivered over plain HTTP, and the
-onboarding network is open, so someone in radio range could run a fake
-onboarding network that serves a different Root CA. This design accepts that
-risk for a home network where only trusted people enrol devices. The shown
-fingerprint allows a manual check. Deployments that want more can instead
-give the portal a publicly trusted certificate (for example Let's Encrypt
-with DNS-01 on a domain they own; no public address records are needed), or
-pre-install the Root CA on each device out of band.
+**Accepted risk.** Sign-in, the enrolment code and the script travel over
+plain HTTP on the onboarding network.
+
+* Passive capture of the password is prevented by requiring **Enhanced
+  Open (OWE)**, which encrypts the radio link per client. The onboarding
+  network must never be plain open.
+* OWE does not authenticate the access point, so someone in radio range
+  could run a fake onboarding network, collect the password and hand out a
+  script of their own. Delivering the Root CA over HTTP, then switching to
+  HTTPS, would not prevent that either: a fake network can hand out its own
+  Root CA. This design accepts the risk for a home network where only
+  trusted people enrol devices, in range of the home.
+
+Deployments that want more can give the portal a publicly trusted
+certificate (for example Let's Encrypt with DNS-01 on a domain they own; no
+public address records are needed) and send the captive portal to HTTPS
+instead, or pre-install the Root CA on each device out of band.
 
 ## Device identity
 
@@ -318,8 +314,7 @@ Portal only:
 | `CERT_ENROLMENT_WIFI_SSID` | required | Trusted network the scripts configure; 1 to 32 printable ASCII characters |
 | `CERT_ENROLMENT_RADIUS_SERVER_NAME` | required | DNS name in the RADIUS server certificate, which devices validate |
 | `CERT_ENROLMENT_SESSION_MINUTES` | `30` | Idle time before a session expires |
-| `CERT_ENROLMENT_ONBOARDING_LISTEN` | none | Address and port for the plain-HTTP onboarding site, e.g. `0.0.0.0:8081`; unset serves none |
-| `CERT_ENROLMENT_PUBLIC_URL` | required with onboarding | The portal as people reach it, `https://host[:port]`; the onboarding page links to it |
+| `CERT_ENROLMENT_ONBOARDING_LISTEN` | none | Address and port to also serve the portal on for plain HTTP from the onboarding network, e.g. `0.0.0.0:8081`; unset serves none |
 
 RA only:
 
@@ -351,7 +346,7 @@ proxy terminates TLS:
 
 * for the portal host name (e.g. `join.<domain>`), plainly;
 * on plain HTTP for the portal host name, to the onboarding listener, if
-  used (and nothing else on plain HTTP);
+  used, and only for the onboarding network;
 * for the RA host name (e.g. `ra.<domain>`), with optional client
   certificates verified against the Root and Intermediate CA, passing
   `X-Client-Verify` (`$ssl_client_verify` in NGINX) and `X-Client-Cert`
@@ -368,7 +363,7 @@ and Ansible, is the `cert-enrolment` role in
 src/
 ├── main.rs      chooses the role
 ├── shared/      device model and validation, HTTP helpers, settings, random tokens, times
-├── portal/      pages, sessions, sign-in, the RA client, enrolment script templates, onboarding site
+├── portal/      pages, sessions, sign-in, the RA client, enrolment script templates
 └── ra/          API, device records, certificates, enrolment codes, step-ca client, tokens
 ```
 
@@ -380,8 +375,7 @@ src/
 | `ldap3` | LDAP (sync API, rustls with ring; no OpenSSL) |
 | `p256`, `base64`, `serde_json` | Signing step-ca tokens (ES256 JWS); JSON |
 | `ureq` | HTTP client: RA to step-ca (rustls), portal to RA |
-| `x509-parser` | Reading serials, names and expiry from certificates (RA); the Root CA's name (onboarding) |
-| `sha2` | The Root CA fingerprint shown on the onboarding page (already built as part of `p256`) |
+| `x509-parser` | Reading serials, names and expiry from certificates (RA) |
 
 Random tokens come from `/dev/urandom`.
 
@@ -411,7 +405,7 @@ request.
 * [x] Linux enrolment script (tested end to end, including renewal)
 * [x] Windows enrolment script (a real Windows 11 device enrolled: TPM key, certificate, Wi-Fi profile, renewal task)
 * [x] Portal and RA roles; renewal through the RA; revocation in step-ca on delete (tested end to end against step-ca 0.30.2)
-* [x] Onboarding: HTTP bootstrap page with the Root CA
+* [x] Onboarding: the portal over plain HTTP as the captive portal
 * [x] Certificate expiry on the Devices page
 * [ ] Captive-portal setup on the access points
 * [ ] step-ca SCEP provisioner and challenge webhook

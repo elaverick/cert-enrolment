@@ -1,9 +1,13 @@
-// Progressive enhancement. Everything works without it; with it, the
-// enrolment form preselects the platform from the browser and its
-// illustration follows the chosen platform, and the onboarding page opens
-// only this device's instructions.
+// Progressive enhancement for the enrolment form. Everything works without
+// it; with it, the platform is preselected from the browser and the
+// illustration follows the chosen platform.
 (function () {
   "use strict";
+
+  const select = document.getElementById("platform");
+  if (!select) {
+    return;
+  }
 
   // Browsers do not expose the computer's name, but they do reveal the
   // operating system. iPadOS Safari reports itself as a Mac, so a Mac with
@@ -22,23 +26,6 @@
       return "linux";
     }
     return null;
-  }
-
-  // Onboarding: every platform's section is open without the script; with
-  // it, only this device's stays open, if it is one of them.
-  const sections = document.querySelectorAll("details[data-platform]");
-  if (sections.length > 0) {
-    const detected = detectPlatform();
-    if (detected && document.querySelector('details[data-platform="' + detected + '"]')) {
-      sections.forEach(function (section) {
-        section.open = section.dataset.platform === detected;
-      });
-    }
-  }
-
-  const select = document.getElementById("platform");
-  if (!select) {
-    return;
   }
 
   // The server marks the select when it has already chosen a value, such as

@@ -2,25 +2,26 @@
 //! managing them.
 //!
 //! Plain HTTP only: a reverse proxy terminates TLS for the portal host name.
-//! Optionally, a second listener serves the onboarding site, which is meant
-//! to be reached over plain HTTP.
+//! Optionally, a second listener serves the same pages over plain HTTP, as
+//! the onboarding network's captive portal. Each listener has its own
+//! sessions and cookies, so a session never crosses between them.
 
 mod assets;
 mod config;
 mod directory;
 mod enrolment;
-mod onboarding;
 mod pages;
 mod ra_client;
 mod session;
 
 use std::process::ExitCode;
+use std::sync::mpsc::{self, Sender};
 use std::thread;
 
 use tiny_http::{Method, Request, Server};
 
 use crate::shared::device::{device_id, label_from_id, valid_description, valid_label, Platform};
-use crate::shared::http::{self, Reply, LOGIN_CSRF_COOKIE, SESSION_COOKIE};
+use crate::shared::http::{self, Cookies, Reply, HTTPS_COOKIES, ONBOARDING_COOKIES};
 use crate::shared::random::{random_token, tokens_match};
 use crate::shared::time;
 use config::Config;
@@ -39,38 +40,25 @@ pub fn run() -> ExitCode {
 
     let ra = RaClient::new(&config.ra_url, &config.ra_api_key);
 
-    let server = match Server::http(&config.listen) {
-        Ok(server) => server,
-        Err(err) => {
-            eprintln!("cert-enrolment: cannot listen on {}: {err}", config.listen);
+    // Requests from every listener are handled one at a time on this thread,
+    // tagged with the listener's index into `sessions`.
+    let (sender, requests) = mpsc::channel();
+    let mut sessions = vec![Sessions::new(config.session_idle, HTTPS_COOKIES)];
+    if let Err(err) = listen(&config.listen, 0, sender.clone()) {
+        eprintln!("cert-enrolment: {err}");
+        return ExitCode::FAILURE;
+    }
+    if let Some(address) = &config.onboarding_listen {
+        sessions.push(Sessions::new(config.session_idle, ONBOARDING_COOKIES));
+        if let Err(err) = listen(address, 1, sender.clone()) {
+            eprintln!("cert-enrolment: {err} (onboarding)");
             return ExitCode::FAILURE;
         }
-    };
-
-    eprintln!("cert-enrolment: listening on {}", config.listen);
-
-    if let Some(settings) = &config.onboarding {
-        let started = onboarding::Onboarding::new(&config.root_ca_pem, &settings.public_url).and_then(|site| {
-            let server = Server::http(&settings.listen)
-                .map_err(|err| format!("cannot listen on {} for onboarding: {err}", settings.listen))?;
-            Ok((site, server))
-        });
-        match started {
-            Ok((site, server)) => {
-                eprintln!("cert-enrolment: onboarding site listening on {}", settings.listen);
-                thread::spawn(move || onboarding::serve(server, site));
-            }
-            Err(err) => {
-                eprintln!("cert-enrolment: {err}");
-                return ExitCode::FAILURE;
-            }
-        }
     }
+    drop(sender);
 
-    let mut sessions = Sessions::new(config.session_idle);
-
-    for mut request in server.incoming_requests() {
-        let response = route(&config, &ra, &mut sessions, &mut request);
+    for (mut request, listener) in requests {
+        let response = route(&config, &ra, &mut sessions[listener], &mut request);
 
         if let Err(err) = request.respond(response) {
             eprintln!("cert-enrolment: failed to send response: {err}");
@@ -78,6 +66,20 @@ pub fn run() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Accepts requests on `address` and passes them on, tagged with `listener`.
+fn listen(address: &str, listener: usize, sender: Sender<(Request, usize)>) -> Result<(), String> {
+    let server = Server::http(address).map_err(|err| format!("cannot listen on {address}: {err}"))?;
+    eprintln!("cert-enrolment: listening on {address}");
+    thread::spawn(move || {
+        for request in server.incoming_requests() {
+            if sender.send((request, listener)).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(())
 }
 
 fn route(config: &Config, ra: &RaClient, sessions: &mut Sessions, request: &mut Request) -> Reply {
@@ -106,6 +108,8 @@ fn route(config: &Config, ra: &RaClient, sessions: &mut Sessions, request: &mut 
         (Method::Get, "/login") => sign_in_form(sessions, request),
         (Method::Post, "/login") => sign_in(config, sessions, request),
         (Method::Post, "/logout") => sign_out(sessions, request),
+        // Captive portals add their own paths and parameters.
+        (Method::Get, _) => http::redirect("/"),
         _ => http::text(404, "not found\n"),
     }
 }
@@ -117,7 +121,7 @@ struct SignedIn {
 }
 
 fn signed_in(sessions: &mut Sessions, request: &Request) -> Option<SignedIn> {
-    let session = sessions.get(http::cookie(request, SESSION_COOKIE)?)?;
+    let session = sessions.get(http::cookie(request, sessions.cookies.session)?)?;
     Some(SignedIn { username: session.username.clone(), csrf_token: session.csrf_token.clone() })
 }
 
@@ -369,15 +373,15 @@ fn sign_in_form(sessions: &mut Sessions, request: &Request) -> Reply {
     if signed_in(sessions, request).is_some() {
         return http::redirect("/enrol");
     }
-    sign_in_page(200, "", None)
+    sign_in_page(sessions.cookies, 200, "", None)
 }
 
 /// Renders the sign-in form with a fresh login CSRF token, which must come
 /// back both in the form and in its cookie.
-fn sign_in_page(status: u16, username: &str, error: Option<&str>) -> Reply {
+fn sign_in_page(cookies: Cookies, status: u16, username: &str, error: Option<&str>) -> Reply {
     match random_token() {
         Ok(token) => http::html(status, pages::sign_in(&token, username, error))
-            .with_header(http::set_cookie(LOGIN_CSRF_COOKIE, &token)),
+            .with_header(cookies.set(cookies.login_csrf, &token)),
         Err(err) => {
             eprintln!("cert-enrolment: {err}");
             http::text(500, "internal error\n")
@@ -386,7 +390,8 @@ fn sign_in_page(status: u16, username: &str, error: Option<&str>) -> Reply {
 }
 
 fn sign_in(config: &Config, sessions: &mut Sessions, request: &mut Request) -> Reply {
-    let expected_csrf = http::cookie(request, LOGIN_CSRF_COOKIE).map(str::to_string);
+    let cookies = sessions.cookies;
+    let expected_csrf = http::cookie(request, cookies.login_csrf).map(str::to_string);
 
     let Ok(form) = http::read_form(request) else {
         return http::text(400, "bad request\n");
@@ -398,7 +403,7 @@ fn sign_in(config: &Config, sessions: &mut Sessions, request: &mut Request) -> R
     let csrf_ok = expected_csrf
         .is_some_and(|expected| tokens_match(&expected, http::form_value(&form, "csrf")));
     if !csrf_ok {
-        return sign_in_page(400, username, Some("The sign-in form expired. Please try again."));
+        return sign_in_page(cookies, 400, username, Some("The sign-in form expired. Please try again."));
     }
 
     let who = if crate::shared::user::valid_username(username) { username } else { "<invalid user name>" };
@@ -408,29 +413,30 @@ fn sign_in(config: &Config, sessions: &mut Sessions, request: &mut Request) -> R
             Ok(token) => {
                 eprintln!("cert-enrolment: sign-in allowed for {who}");
                 http::redirect("/enrol")
-                    .with_header(http::set_cookie(SESSION_COOKIE, &token))
-                    .with_header(http::clear_cookie(LOGIN_CSRF_COOKIE))
+                    .with_header(cookies.set(cookies.session, &token))
+                    .with_header(cookies.clear(cookies.login_csrf))
             }
             Err(err) => unavailable(&format!("sign-in for {who} failed: {err}")),
         },
         Ok(SignIn::NotEnroller) => {
             eprintln!("cert-enrolment: sign-in refused for {who}: not in the enrollers group");
-            sign_in_page(403, username, Some("Your account is not permitted to enrol devices."))
+            sign_in_page(cookies, 403, username, Some("Your account is not permitted to enrol devices."))
         }
         Ok(SignIn::InvalidCredentials) => {
             eprintln!("cert-enrolment: sign-in failed for {who}: invalid credentials");
-            sign_in_page(401, username, Some("Incorrect user name or password."))
+            sign_in_page(cookies, 401, username, Some("Incorrect user name or password."))
         }
         Err(err) => unavailable(&format!("sign-in for {who} failed: {err}")),
     }
 }
 
 fn sign_out(sessions: &mut Sessions, request: &mut Request) -> Reply {
-    let Some(token) = http::cookie(request, SESSION_COOKIE).map(str::to_string) else {
+    let cookies = sessions.cookies;
+    let Some(token) = http::cookie(request, cookies.session).map(str::to_string) else {
         return http::redirect("/login");
     };
     let Some(expected_csrf) = sessions.get(&token).map(|session| session.csrf_token.clone()) else {
-        return http::redirect("/login").with_header(http::clear_cookie(SESSION_COOKIE));
+        return http::redirect("/login").with_header(cookies.clear(cookies.session));
     };
 
     let Ok(form) = http::read_form(request) else {
@@ -441,5 +447,5 @@ fn sign_out(sessions: &mut Sessions, request: &mut Request) -> Reply {
     }
 
     sessions.remove(&token);
-    http::redirect("/login").with_header(http::clear_cookie(SESSION_COOKIE))
+    http::redirect("/login").with_header(cookies.clear(cookies.session))
 }
