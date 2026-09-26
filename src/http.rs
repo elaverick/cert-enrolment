@@ -126,6 +126,14 @@ pub fn asset(content_type: &str, body: &[u8]) -> Reply {
         .with_header(raw_header("Cache-Control", "public, max-age=3600"))
 }
 
+/// A generated file offered for saving. It may hold a credential, so it is
+/// never cached.
+pub fn download(file_name: &str, content_type: &str, body: String) -> Reply {
+    secure(Response::from_string(body))
+        .with_header(raw_header("Content-Type", content_type))
+        .with_header(raw_header("Content-Disposition", &format!("attachment; filename=\"{file_name}\"")))
+}
+
 /// 303 so that a POST is followed by a GET.
 pub fn redirect(location: &str) -> Reply {
     secure(Response::from_string("").with_status_code(303))

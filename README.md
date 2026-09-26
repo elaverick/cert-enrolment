@@ -119,14 +119,43 @@ pre-install the Root CA on each device out of band.
 
 | Platform | Delivered as | Key storage | Issuance | Renewal |
 |---|---|---|---|---|
-| Windows 11 | PowerShell script, run once as administrator | TPM (Microsoft Platform Crypto Provider), machine store | step-ca JWK provisioner, single-use token | Scheduled task, mTLS renewal against step-ca |
-| Linux | Shell script | File, root-only | step-ca JWK provisioner, single-use token | systemd timer, `step ca renew` |
+| Windows 11 | PowerShell script, run once as administrator | TPM (Microsoft Platform Crypto Provider), Local Computer store, not exportable | step-ca JWK provisioner, single-use token | Scheduled task (daily and at start-up) |
+| Linux | Shell script, run once as root | File, root-only | step-ca JWK provisioner, single-use token | systemd timer (daily) |
 | iOS | `.mobileconfig` profile (Root CA + SCEP + Wi-Fi) | Keychain | step-ca SCEP provisioner, challenge checked by `cert-enrolment` webhook | Re-download from the portal before expiry, until an MDM is used |
 
 The Wi-Fi configuration on every platform is for the trusted network, trusts
 only the Root CA, validates the RADIUS server name, and uses TLS 1.3. Linux
 supplicants (wpa_supplicant 2.10) disable EAP TLS 1.3 by default, so the
-Linux script enables it explicitly.
+Linux script enables it explicitly. Windows 11 22H2 and later use TLS 1.3 for
+EAP-TLS by default.
+
+### Enrolment scripts
+
+* Downloaded from the Enrol step (`POST /enrol/download`), which signs a
+  fresh token for the device each time. Disabled devices are refused.
+* Every value written into a script has a restricted format (checked at
+  start-up or registration) and is also quoted for the script language.
+  Scripts are ASCII; Windows scripts use CRLF and Linux scripts LF.
+* **Windows** (`enrol-<name>.ps1`, Windows PowerShell 5.1 or later, run
+  elevated): adds the Root CA to Local Computer › Trusted Root CAs; creates
+  a P-256 key in the TPM with `certreq` (`-AllowSoftwareKey` falls back to a
+  non-exportable software key); sends the request and token to step-ca;
+  installs the certificate and its intermediate; adds a WPA3-Enterprise
+  EAP-TLS profile (machine authentication, server name and Root CA
+  pinned) with `netsh wlan add profile ... user=all` (`-SkipWifi` skips
+  it); writes `%ProgramData%\cert-enrolment\renew.ps1` (SYSTEM and
+  Administrators only) and registers the scheduled task
+  `cert-enrolment renewal`.
+* **Linux** (`enrol-<name>.sh`, POSIX sh with curl, OpenSSL and GNU
+  `date`, run as root): keeps its files in `/etc/cert-enrolment`, installs
+  `/usr/local/libexec/cert-enrolment-renew`, adds a NetworkManager profile
+  when `nmcli` is present (otherwise prints a wpa_supplicant block), and a
+  systemd timer when systemd is present (otherwise asks for a cron entry).
+* **Renewal** runs daily and acts once two thirds of the certificate's
+  lifetime has passed. It creates a new key and calls step-ca's
+  `/1.0/rekey`, authenticated with the current certificate, so every
+  renewal also rotates the key. An expired certificate cannot be renewed;
+  the device must be enrolled again.
 
 ## Enrolment tokens
 
@@ -238,6 +267,9 @@ Linux script enables it explicitly.
 | `CERT_ENROLMENT_CA_URL` | required | step-ca base URL as devices reach it; must be `https://`. Tokens are issued for `<this URL>/1.0/sign` |
 | `CERT_ENROLMENT_PROVISIONER` | required | Name of the step-ca JWK provisioner whose key signs enrolment tokens |
 | `CERT_ENROLMENT_PROVISIONER_KEY_FILE` | required | File holding that provisioner's private key as an EC P-256 JWK (for example a container secret). Checked at start-up |
+| `CERT_ENROLMENT_WIFI_SSID` | required | Trusted network the scripts configure; 1 to 32 printable ASCII characters |
+| `CERT_ENROLMENT_RADIUS_SERVER_NAME` | required | DNS name in the RADIUS server certificate, which devices validate |
+| `CERT_ENROLMENT_ROOT_CA_FILE` | `SSL_CERT_FILE` | PEM file with the one Root CA certificate devices are given to trust |
 | `CERT_ENROLMENT_SESSION_MINUTES` | `30` | Idle time before a session expires |
 | `SSL_CERT_FILE` | none | PEM file of CAs trusted for LDAPS. Set it to your Root CA; the image has no other trust store |
 
@@ -290,8 +322,8 @@ request.
 * [x] Disable, enable and delete devices
 * [x] Reference deployment (homelab role, NGINX site and certificate)
 * [x] step-ca JWK provisioner and single-use token signing
-* [ ] Windows enrolment script
-* [ ] Linux enrolment script
+* [x] Linux enrolment script (tested end to end against step-ca, including renewal)
+* [x] Windows enrolment script (parsed by Windows PowerShell 5.1 and 7; not yet run on a real device)
 * [ ] Onboarding: HTTP bootstrap page with the Root CA, and captive-portal setup
 * [ ] step-ca SCEP provisioner and challenge webhook
 * [ ] iOS enrolment profile

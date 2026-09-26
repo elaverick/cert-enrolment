@@ -66,7 +66,6 @@ impl Provisioner {
 
     /// Signs a token that lets the holder obtain one certificate for
     /// `device_id`, within `lifetime`.
-    #[allow(dead_code)] // Used by the enrolment scripts, which come next.
     pub fn token(&self, device_id: &str, lifetime: Duration) -> Result<String, String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

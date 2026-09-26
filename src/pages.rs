@@ -203,12 +203,33 @@ pub fn enrol(form: &EnrolForm) -> String {
     })
 }
 
-/// Step 3, shown once the device is registered.
-pub fn enrolled(device: &Device, csrf_token: &str) -> String {
+/// Step 3: how to enrol a registered device, with its enrolment script.
+pub fn enrolled(device: &Device, csrf_token: &str, error: Option<&str>) -> String {
     let description = if device.description.is_empty() {
         String::new()
     } else {
         format!("<dt>Description</dt><dd>{}</dd>", escape(&device.description))
+    };
+
+    let instructions = match Platform::from_id(&device.platform) {
+        Some(Platform::Windows) => script_instructions(
+            device,
+            csrf_token,
+            "Download the enrolment script on this Windows computer, then open PowerShell as administrator in the folder you saved it to and run:",
+            &format!("powershell -ExecutionPolicy Bypass -File .\\enrol-{}.ps1", device.label),
+            "It trusts the network’s Root CA, creates a key in the TPM, installs the device certificate, adds the Wi-Fi profile and schedules renewal.",
+        ),
+        Some(Platform::Linux) => script_instructions(
+            device,
+            csrf_token,
+            "Download the enrolment script on this Linux computer, then run it as root from the folder you saved it to:",
+            &format!("sudo sh ./enrol-{}.sh", device.label),
+            "It saves the network’s Root CA, creates a key readable only by root, installs the device certificate, adds a NetworkManager profile and a renewal timer.",
+        ),
+        _ => format!(
+            r#"<p>Enrolment for {} is not available yet. The device is registered and appears under Devices.</p>"#,
+            escape(platform_label(&device.platform))
+        ),
     };
 
     render(Page {
@@ -220,22 +241,48 @@ pub fn enrolled(device: &Device, csrf_token: &str) -> String {
             r#"{steps}
 <section class="card" aria-labelledby="enrol">
 <h2 id="enrol">3. Enrol the device</h2>
-<p class="notice" role="status">Registered {id}.</p>
-<dl class="summary">
+{error}<dl class="summary">
 <dt>Device</dt><dd>{id}</dd>
 {description}
 <dt>Type</dt><dd>{platform}</dd>
 <dt>Zone</dt><dd>{zone}</dd>
 </dl>
-<p>Certificate enrolment for {platform} is not available yet. The device is registered and will appear under Devices; once enrolment is ready, you will download its enrolment file here.</p>
+{instructions}
+<hr>
+<div class="next">
+<h3>What happens next?</h3>
+<ol>
+<li><span class="step-marker" aria-hidden="true">4</span><strong>Connect to Wi-Fi</strong><span class="detail">Once enrolled, the device joins the trusted Wi-Fi automatically when it is in range, and renews its certificate by itself.</span></li>
+</ol>
+</div>
 <a href="/devices" class="button secondary">Go to devices</a>
 </section>"#,
             steps = steps(3),
+            error = message("error", error),
             id = escape(&device.id),
             platform = escape(platform_label(&device.platform)),
             zone = escape(&device.zone),
         ),
     })
+}
+
+fn script_instructions(device: &Device, csrf_token: &str, before: &str, command: &str, after: &str) -> String {
+    format!(
+        r#"<p>{before}</p>
+<pre class="command"><code>{command}</code></pre>
+<p class="muted">{after} The script works once, within ten minutes of downloading; download it again if it expires.</p>
+<form method="post" action="/enrol/download">
+<input type="hidden" name="csrf" value="{csrf}">
+<input type="hidden" name="device" value="{label}">
+<button type="submit" class="block">Download enrolment script {arrow}</button>
+</form>"#,
+        before = escape(before),
+        command = escape(command),
+        after = escape(after),
+        csrf = escape(csrf_token),
+        label = escape(&device.label),
+        arrow = ARROW,
+    )
 }
 
 pub fn devices(devices: &[Device], csrf_token: &str, notice: Option<&str>, error: Option<&str>) -> String {
@@ -253,11 +300,20 @@ pub fn devices(devices: &[Device], csrf_token: &str, notice: Option<&str>, error
                 format!(r#"<span class="detail">{}</span>"#, escape(&device.description))
             };
             format!(
-                r#"<tr><td>{id}{description}</td><td data-label="Type">{platform}</td><td data-label="Zone">{zone}</td><td data-label="Status">{status}</td><td class="actions">{toggle}{delete}</td></tr>
+                r#"<tr><td>{id}{description}</td><td data-label="Type">{platform}</td><td data-label="Zone">{zone}</td><td data-label="Status">{status}</td><td class="actions">{enrol}{toggle}{delete}</td></tr>
 "#,
                 id = escape(&device.id),
                 platform = escape(platform_label(&device.platform)),
                 zone = escape(&device.zone),
+                enrol = if device.disabled || device.label.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        r#"<a href="/enrol/device?device={label}" class="button small secondary" aria-label="Enrol {id}">Enrol</a>"#,
+                        label = escape(&device.label),
+                        id = escape(&device.id),
+                    )
+                },
                 toggle = action_form(toggle_action, toggle_label, &device.id, csrf_token, "secondary"),
                 delete = action_form("delete", "Delete", &device.id, csrf_token, "danger"),
             )

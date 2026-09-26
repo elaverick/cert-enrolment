@@ -320,7 +320,19 @@ td:first-child { overflow-wrap: anywhere; }
 
 .actions { white-space: nowrap; text-align: right; }
 .actions form { display: inline; }
-.actions form + form { margin-left: 0.35rem; }
+.actions > * + * { margin-left: 0.35rem; }
+a.button.small { margin: 0; padding: 0.2rem 0.55rem; font-size: 0.8rem; }
+
+pre.command {
+  margin: 0.75rem 0;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  font: inherit;
+  font-size: 0.85rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
 
 .visually-hidden {
   position: absolute;

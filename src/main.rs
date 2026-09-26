@@ -6,12 +6,14 @@ mod assets;
 mod config;
 mod devices;
 mod directory;
+mod enrolment;
 mod http;
 mod pages;
 mod session;
 mod token;
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use tiny_http::{Method, Request, Server};
 
@@ -20,6 +22,10 @@ use devices::{Change, Platform, Registration};
 use directory::SignIn;
 use http::{Reply, LOGIN_CSRF_COOKIE, SESSION_COOKIE};
 use session::{random_token, tokens_match, Sessions};
+use token::Provisioner;
+
+/// How long a downloaded enrolment script's token stays usable.
+const TOKEN_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 fn main() -> ExitCode {
     let config = match Config::from_env() {
@@ -39,7 +45,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _ = &provisioner;
 
     let server = match Server::http(&config.listen) {
         Ok(server) => server,
@@ -54,7 +59,7 @@ fn main() -> ExitCode {
     let mut sessions = Sessions::new(config.session_idle);
 
     for mut request in server.incoming_requests() {
-        let response = route(&config, &mut sessions, &mut request);
+        let response = route(&config, &provisioner, &mut sessions, &mut request);
 
         if let Err(err) = request.respond(response) {
             eprintln!("cert-enrolment: failed to send response: {err}");
@@ -64,7 +69,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn route(config: &Config, sessions: &mut Sessions, request: &mut Request) -> Reply {
+fn route(config: &Config, provisioner: &Provisioner, sessions: &mut Sessions, request: &mut Request) -> Reply {
     let path = request.url().split('?').next().unwrap_or("/").to_string();
 
     if *request.method() == Method::Get {
@@ -82,6 +87,7 @@ fn route(config: &Config, sessions: &mut Sessions, request: &mut Request) -> Rep
         (Method::Get, "/enrol") => enrol_form(config, sessions, request),
         (Method::Post, "/enrol") => register_device(config, sessions, request),
         (Method::Get, "/enrol/device") => enrolled(config, sessions, request),
+        (Method::Post, "/enrol/download") => download_script(config, provisioner, sessions, request),
         (Method::Get, "/devices") => device_list(config, sessions, request),
         (Method::Post, "/devices/disable") => device_action(config, sessions, request, Action::Disable),
         (Method::Post, "/devices/enable") => device_action(config, sessions, request, Action::Enable),
@@ -202,10 +208,49 @@ fn enrolled(config: &Config, sessions: &mut Sessions, request: &Request) -> Repl
     };
 
     match devices::get(config, label) {
-        Ok(Some(device)) => http::html(200, pages::enrolled(&device, &user.csrf_token)),
+        Ok(Some(device)) => http::html(200, pages::enrolled(&device, &user.csrf_token, None)),
         Ok(None) => http::redirect("/enrol"),
         Err(err) => unavailable(&err),
     }
+}
+
+/// Returns the enrolment script for a registered, enabled device, with a
+/// fresh single-use token written in.
+fn download_script(config: &Config, provisioner: &Provisioner, sessions: &mut Sessions, request: &mut Request) -> Reply {
+    let Some(user) = signed_in(sessions, request) else {
+        return http::redirect("/login");
+    };
+    let Some(form) = session_form(request, &user) else {
+        return http::text(400, "bad request\n");
+    };
+    let label = http::form_value(&form, "device");
+    if !devices::valid_label(label) {
+        return http::text(400, "bad request\n");
+    }
+
+    let device = match devices::get(config, label) {
+        Ok(Some(device)) => device,
+        Ok(None) => return http::redirect("/enrol"),
+        Err(err) => return unavailable(&err),
+    };
+    if device.disabled {
+        let error = "This device is disabled. Enable it under Devices before enrolling it.";
+        return http::html(409, pages::enrolled(&device, &user.csrf_token, Some(error)));
+    }
+
+    let Some(platform) = Platform::from_id(&device.platform) else {
+        return http::text(400, "bad request\n");
+    };
+    let token = match provisioner.token(&device.id, TOKEN_LIFETIME) {
+        Ok(token) => token,
+        Err(err) => return unavailable(&err),
+    };
+    let Some(script) = enrolment::script(config, platform, label, &device.id, &token) else {
+        return http::text(400, "bad request\n");
+    };
+
+    eprintln!("cert-enrolment: {} downloaded the enrolment script for {}", user.username, device.id);
+    http::download(&script.file_name, script.content_type, script.body)
 }
 
 // Device management

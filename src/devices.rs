@@ -53,6 +53,8 @@ impl Platform {
 
 pub struct Device {
     pub id: String,
+    /// The single label before the device domain.
+    pub label: String,
     /// Optional friendly description, e.g. "Edward's laptop".
     pub description: String,
     pub platform: String,
@@ -166,6 +168,7 @@ fn search(config: &Config, base: &str, scope: Scope) -> Result<Vec<Device>, Stri
         .map(|entry| {
             let first = |name: &str| entry.attrs.get(name).and_then(|v| v.first()).cloned().unwrap_or_default();
             Device {
+                label: label_from_id(&config.device_domain, &first("deviceId")).unwrap_or_default().to_string(),
                 id: first("deviceId"),
                 description: first("description"),
                 platform: first("deviceType"),
