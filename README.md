@@ -6,9 +6,19 @@ uses 802.1X (EAP-TLS).
 `cert-enrolment` lets a member of an LDAP enrollers group register a device
 and download everything that device needs to join the trusted network: a
 device certificate from a [step-ca](https://smallstep.com/docs/step-ca/)
-certificate authority, the Root CA, and the Wi-Fi configuration. It is a
-single small Rust binary, run as a container behind a TLS-terminating
-reverse proxy.
+certificate authority, the Root CA, and the Wi-Fi configuration. Devices then
+renew their certificates by themselves, and deleting a device revokes its
+certificates.
+
+It is one small Rust binary with two roles, run as two containers from the
+same image behind a TLS-terminating reverse proxy:
+
+* **portal** — the web pages people use to sign in, enrol devices and
+  manage them. It holds no signing keys and no LDAP service account.
+* **ra** — the registration authority. It owns device records, obtains
+  every device certificate from step-ca, records each one, and revokes them
+  when a device is deleted. It alone holds the LDAP service account and the
+  step-ca provisioner key.
 
 Names used below are placeholders. Examples use the reserved
 `example.home.arpa` domain; substitute your own.
@@ -16,32 +26,31 @@ Names used below are placeholders. Examples use the reserved
 ## How it fits together
 
 ```text
- browser on the device ──HTTPS──▶ reverse proxy ──HTTP──▶ cert-enrolment ──LDAPS──▶ LDAP
-                                                             │           (devices,
-                                                             │            enrollers group)
-                                              signs single-use tokens
-                                                             │
- device ──── CSR + token (Windows, Linux) ────────────────▶ step-ca
- device ──── SCEP (iOS) ──────────────────────────────────▶ step-ca ──webhook──▶ cert-enrolment
-                                                                          (challenge check)
+ person's browser ──HTTPS──▶ proxy ──▶ portal ──API key──▶ RA ──LDAPS──▶ LDAP (devices, certificates)
+      (join.<domain>)                    │                   │
+                                         └──LDAPS (sign-in)  └──HTTPS──▶ step-ca  (sign, revoke)
 
- device ──── EAP-TLS ──▶ access point ──RADIUS──▶ FreeRADIUS ──▶ LDAP
+ device script ──HTTPS──▶ proxy ──▶ RA   (ra.<domain>)
+                  │         enrol: single-use enrolment code
+                  │         renew: the device's current certificate, verified by the proxy
+                  └─ client certificate optional; the proxy passes the result to the RA
+
+ device ──EAP-TLS──▶ access point ──RADIUS──▶ FreeRADIUS ──▶ LDAP
 ```
 
-`cert-enrolment` never handles a device's private key and never calls
-step-ca itself. Its only outbound connection is to LDAP.
+Each part does its own job:
 
-The companion pieces are expected to be configured as follows:
+| Part | Job |
+|---|---|
+| LDAP | Who may enrol (enrollers group), which devices exist, their zone, whether they are enabled, and their certificates |
+| Portal | Pages; asks the RA to act on behalf of the signed-in user |
+| RA | Policy: checks LDAP, obtains certificates, records serials and expiry, revokes |
+| step-ca | Issues and revokes certificates |
+| FreeRADIUS | Enforces at connection time |
+| Firewall | Enforces what each VLAN may reach; FreeRADIUS only assigns VLANs |
 
-* **step-ca** issues device certificates with clientAuth only, for names
-  under the device domain.
-* **FreeRADIUS** accepts EAP-TLS only. It accepts a device if its
-  certificate chains to the Root CA, carries clientAuth and not serverAuth,
-  has a Common Name that is a single label under the device domain, and
-  matches an enabled device entry in LDAP. The entry's `deviceZone`
-  selects the VLAN returned to the access point.
-* **The firewall** enforces what each VLAN may reach. FreeRADIUS only
-  assigns VLANs.
+Devices never talk to step-ca, and no device private key ever leaves its
+device.
 
 ## Networks
 
@@ -51,7 +60,7 @@ choice; they are referred to here by role.
 | Role | Example name | Security | Who joins | VLAN |
 |---|---|---|---|---|
 | **Trusted** | `Home` | WPA3-Enterprise, EAP-TLS | Enrolled devices | Assigned per device by FreeRADIUS from `deviceZone` (for example `trusted`, `quarantine`) |
-| **Onboarding** | `Home-Setup` | Open, preferably Enhanced Open (OWE), with a captive portal | Devices being enrolled | A dedicated onboarding VLAN that can reach only DNS, `cert-enrolment` and step-ca, never the internet |
+| **Onboarding** | `Home-Setup` | Open, preferably Enhanced Open (OWE), with a captive portal | Devices being enrolled | A dedicated onboarding VLAN that can reach only DNS, the portal and the RA, never the internet |
 | **IoT** | `Home-IoT` | WPA2/WPA3-Personal | Devices that cannot do 802.1X | A lower-trust IoT VLAN |
 
 Why three and not one:
@@ -83,11 +92,11 @@ Why three and not one:
    * **Linux:** a one-line install.
 3. The user continues to `https://join.<domain>/`, now trusted. Sign-in,
    registration and the enrolment download all happen over HTTPS.
-4. The enrolment material installs the device certificate and a Wi-Fi
-   profile for the trusted network, and the device moves to it.
+4. The enrolment script obtains the device certificate from the RA and adds
+   a Wi-Fi profile for the trusted network, and the device moves to it.
 
 Captive-portal configuration: point the onboarding network's external portal
-at the HTTP address, and allow the portal host and step-ca before
+at the HTTP address, and allow the portal and RA host names before
 authorisation. Nothing ever needs to be authorised to reach the internet.
 
 **Accepted risk.** The Root CA is delivered over plain HTTP, and the
@@ -105,23 +114,42 @@ pre-install the Root CA on each device out of band.
   `ed-laptop.device.example.home.arpa`: a single label under the device
   domain. This name is the certificate Common Name and the LDAP `deviceId`.
   It is never published in DNS.
-* Device entries use object classes `device` and `managedDevice`
-  (`deviceId`, `deviceType`, `deviceZone`, `deviceDisabled`) in a devices
-  container such as `ou=Devices,dc=example,dc=home,dc=arpa`.
+* Device entries use object classes `device` and `managedDevice` in a
+  devices container such as `ou=Devices,dc=example,dc=home,dc=arpa`:
+  `deviceId`, `description`, `deviceType`, `deviceZone`, `deviceDisabled`,
+  `owner` (the enroller who registered it) and `deviceCertificate`.
+* `deviceCertificate` holds one value per certificate the RA obtained for
+  the device: its serial in hex and its expiry, `<serial> <YYYYMMDDHHMMSSZ>`.
+  Values are removed once their certificate has expired.
 
-## Enrolment flow
+## Enrolment and renewal
 
-1. A member of the enrollers group signs in with their LDAP credentials.
-2. They register a device (name, type, zone), which creates its LDAP entry.
-3. On the device itself they download the enrolment material for its
-   platform. Each download embeds a credential that is single-use, bound
-   to that device name, and valid for about ten minutes.
+1. A member of the enrollers group signs in to the portal with their LDAP
+   credentials and registers a device (name, type, zone). The RA creates
+   its LDAP entry.
+2. On the device itself they download the enrolment script for its
+   platform. For each download the RA issues a random enrolment code for
+   that device, valid for ten minutes and usable once, and the portal writes
+   it into the script.
+3. The script creates a key on the device and sends a certificate request
+   with the code to the RA (`POST /v1/enrol`). The RA checks the code and
+   that the device is registered and enabled, has step-ca sign the request
+   with a token naming only that device, records the certificate, and
+   returns it.
+4. Once two thirds of the certificate's lifetime has passed, the device
+   creates a new key and sends a certificate request to the RA
+   (`POST /v1/renew`), presenting its current certificate. The proxy
+   verifies it against the CA chain; the RA then requires that the device is
+   still registered and enabled, and that the certificate presented is the
+   **newest** one recorded for it. A copy of an older certificate cannot
+   renew, and nor can certificates from before a device was deleted and
+   registered again.
 
-| Platform | Delivered as | Key storage | Issuance | Renewal |
-|---|---|---|---|---|
-| Windows 11 | PowerShell script, run once as administrator | TPM (Microsoft Platform Crypto Provider), Local Computer store, not exportable | step-ca JWK provisioner, single-use token | Scheduled task (daily and at start-up) |
-| Linux | Shell script, run once as root | File, root-only | step-ca JWK provisioner, single-use token | systemd timer (daily) |
-| iOS | `.mobileconfig` profile (Root CA + SCEP + Wi-Fi) | Keychain | step-ca SCEP provisioner, challenge checked by `cert-enrolment` webhook | Re-download from the portal before expiry, until an MDM is used |
+| Platform | Delivered as | Key storage | Renewal |
+|---|---|---|---|
+| Windows 11 | PowerShell script, run once as administrator | TPM (Microsoft Platform Crypto Provider), Local Computer store, not exportable | Scheduled task (daily and at start-up) |
+| Linux | Shell script, run once as root | File, root-only | systemd timer (daily) |
+| iOS | `.mobileconfig` profile (Root CA + SCEP + Wi-Fi) — planned | Keychain | Re-download from the portal before expiry, until an MDM is used |
 
 The Wi-Fi configuration on every platform is for the trusted network, trusts
 only the Root CA, validates the RADIUS server name, and uses TLS 1.3. Linux
@@ -131,103 +159,75 @@ EAP-TLS by default.
 
 ### Enrolment scripts
 
-* Downloaded from the Enrol step (`POST /enrol/download`), which signs a
-  fresh token for the device each time. Disabled devices are refused.
+* Downloaded from the Enrol step (`POST /enrol/download`). Disabled devices
+  are refused.
 * Every value written into a script has a restricted format (checked at
   start-up or registration) and is also quoted for the script language.
   Scripts are ASCII; Windows scripts use CRLF and Linux scripts LF.
+* Before changing anything, the scripts check that the RA's host name
+  resolves. A service that cannot be reached is reported with the code
+  unused, so the script can simply be run again.
 * **Windows** (`enrol-<name>.ps1`, Windows PowerShell 5.1 or later, run
   elevated): adds the Root CA to Local Computer › Trusted Root CAs; creates
   a P-256 key in the TPM with `certreq` (`-AllowSoftwareKey` falls back to a
-  non-exportable software key); sends the request and token to step-ca;
-  installs the certificate and its intermediate; adds a WPA3-Enterprise
-  EAP-TLS profile (machine authentication, server name and Root CA
-  pinned) with `netsh wlan add profile ... user=all` (`-SkipWifi` skips
-  it); writes `%ProgramData%\cert-enrolment\renew.ps1` (SYSTEM and
-  Administrators only) and registers the scheduled task
-  `cert-enrolment renewal`.
+  non-exportable software key); installs the certificate and its
+  intermediate; adds a WPA3-Enterprise EAP-TLS profile (machine
+  authentication, server name and Root CA pinned) with
+  `netsh wlan add profile ... user=all` (`-SkipWifi` skips it); writes
+  `%ProgramData%\cert-enrolment\renew.ps1` (SYSTEM and Administrators only)
+  and registers the scheduled task `cert-enrolment renewal`. Pending
+  requests and keys left by failed attempts are removed.
 * **Linux** (`enrol-<name>.sh`, POSIX sh with curl, OpenSSL and GNU
   `date`, run as root): keeps its files in `/etc/cert-enrolment`, installs
   `/usr/local/libexec/cert-enrolment-renew`, adds a NetworkManager profile
   when `nmcli` is present (otherwise prints a wpa_supplicant block), and a
   systemd timer when systemd is present (otherwise asks for a cron entry).
-* **Renewal** runs daily and acts once two thirds of the certificate's
-  lifetime has passed. It creates a new key and calls step-ca's
-  `/1.0/rekey`, authenticated with the current certificate, so every
-  renewal also rotates the key. An expired certificate cannot be renewed;
-  the device must be enrolled again.
-
-## Enrolment tokens
-
-* step-ca has a JWK provisioner whose **public** key is in its configuration;
-  `cert-enrolment` holds the **private** key. Nothing else needs it, so the
-  key is not stored encrypted in the CA configuration.
-* Each token is an ES256 JWT for one device name (`sub` and `sans`), with a
-  random `jti`, valid for ten minutes. step-ca records spent tokens, so each
-  can be used once.
-* The provisioner's certificate template issues clientAuth only; the CA
-  policy must allow the device domain (one label deep, as step-ca
-  wildcards match a single label).
-* Keep the provisioner key stable. Certificates record which provisioner
-  issued them, and renewals are checked against it; a new key means every
-  device must enrol again.
+* A device that stays off past expiry cannot renew and must be enrolled
+  again.
 
 ## Certificates
 
-* 30-day lifetime on every platform.
-* clientAuth only. FreeRADIUS rejects certificates that also carry
-  serverAuth, which excludes service certificates from the same CA.
-* A Windows or Linux device that stays off past expiry cannot renew and
-  must be enrolled again.
-* Revocation: set `deviceDisabled` in LDAP (effective at the next
-  association). Revoking in step-ca additionally blocks renewal.
+* 30-day lifetime on every platform; clientAuth only. FreeRADIUS rejects
+  certificates that also carry serverAuth, which excludes service
+  certificates from the same CA.
+* step-ca has a JWK provisioner whose **public** key is in its
+  configuration; the RA holds the **private** key and signs single-use
+  tokens with it: sign tokens name one device, revoke tokens one serial.
+  Nothing else needs the key, so it is not stored encrypted in the CA
+  configuration. Keep it stable: certificates record which provisioner
+  issued them.
+* step-ca's own renewal is **disabled** for this provisioner, so every
+  certificate goes through the RA and every serial is recorded.
+* The provisioner's certificate template issues clientAuth only; the CA
+  policy must allow the device domain (one label deep, as step-ca wildcards
+  match a single label).
+* **Disable** a device: FreeRADIUS refuses it at its next association, and
+  the RA refuses to renew its certificates. Enabling it again restores both.
+* **Delete** a device: the RA first disables it, then revokes every
+  unexpired certificate recorded for it in step-ca (passive revocation),
+  then removes its entry. If a revocation fails, the device stays disabled
+  and deleting it again resumes.
 
-## Pages
+## Portal
 
 * **Enrol a device** (`/enrol`): a stepped flow, Sign in → Device → Enrol
-  → Connect. The Device step registers the device; the Enrol step
-  (`/enrol/device`) will deliver the enrolment material.
-* **Devices** (`/devices`): every registered device, with disable, enable
-  and delete.
+  → Connect. The Enrol step (`/enrol/device`) offers the device's script.
+* **Devices** (`/devices`): every registered device, with enrol, disable,
+  enable and delete. Deleting asks for confirmation on a separate page (the
+  Content Security Policy allows no script, so there is no browser dialog).
+* Any enroller can act on any device. Every change is logged by the RA with
+  the enroller and device.
 * Pages use IBM Plex Mono (SIL Open Font License, see
-  `src/assets/fonts/LICENSE.txt`) and a halftone background, all embedded
-  in the binary. The Content Security Policy allows only same-origin
-  scripts, styles, fonts and images.
-* JavaScript is optional. When present it preselects the device type from
-  the browser and shows the matching illustration and naming tip. Browsers
-  do not expose the computer's name, so the name is typed.
+  `src/portal/assets/fonts/LICENSE.txt`) and a halftone background, all
+  embedded in the binary. JavaScript is optional: it preselects the device
+  type from the browser and shows the matching illustration and naming tip.
+  Browsers do not expose the computer's name, so the name is typed.
 
-## Device registration
-
-* A signed-in enroller enters a device name (one DNS label, lowercased),
-  an optional description (up to 64 characters, stored in `description`),
-  a device type (Windows, Linux or iPhone / iPad) and a network zone from
-  `CERT_ENROLMENT_DEVICE_ZONES`.
-* The service account creates `cn=<name>.<device domain>,<devices DN>`
-  with object classes `device` and `managedDevice`: `deviceId` (same as
-  the CN), `description` (if given), `deviceType` (platform), `deviceZone`,
-  `deviceDisabled: FALSE`, and `owner` set to the enroller's DN for
-  auditing.
-* Names that already exist are refused. All enrollers see every device.
-* Registrations are logged with the enroller, device, platform and zone.
-
-## Disabling and deleting devices
-
-* Any enroller can disable, enable or delete any device from the list.
-* Disable sets `deviceDisabled: TRUE`; FreeRADIUS then rejects the device
-  at its next association. Enable sets it back to `FALSE`.
-* Delete removes the LDAP entry after a confirmation page (the Content
-  Security Policy allows no script, so there is no browser dialog).
-* Each change is logged with the enroller and device.
-* Certificates are not yet revoked. A disabled or deleted device's
-  certificate stays valid until it expires, but FreeRADIUS refuses it.
-
-## Sign-in and sessions
+### Sign-in and sessions
 
 * Users sign in by binding to LDAP as themselves; enrollers-group
-  membership is then read over the same connection. Sign-in uses no
-  service account. Account lockout is left to the directory's password
-  policy.
+  membership is then read over the same connection. Account lockout is left
+  to the directory's password policy.
 * Empty passwords are refused before contacting LDAP, because an empty
   password is an anonymous bind, which LDAP accepts.
 * User names are restricted to `[a-z0-9._-]`, and are escaped as well
@@ -236,66 +236,128 @@ EAP-TLS by default.
   ends a session. A restart signs everyone out. Sessions expire after
   `CERT_ENROLMENT_SESSION_MINUTES` of inactivity.
 * Cookies are `__Host-` prefixed, `Secure`, `HttpOnly` and
-  `SameSite=Strict`. Every form carries a CSRF token; the sign-in form
-  uses a double-submit cookie.
+  `SameSite=Strict`. Every form carries a CSRF token; the sign-in form uses
+  a double-submit cookie.
 * Responses carry a restrictive Content Security Policy, `nosniff` and
   `no-referrer`; pages are `no-store`. All page values are HTML-escaped.
+
+## RA API
+
+All bodies are JSON. Errors are `{"error": "<message for people>"}`.
+
+For the portal (`Authorization: Bearer <API key>`, and `X-Actor: <user>`
+naming the signed-in user):
+
+| Method and path | Does |
+|---|---|
+| `GET /api/devices` | Lists devices |
+| `POST /api/devices` | Registers a device: `label`, `description`, `platform`, `zone` |
+| `GET /api/devices/<label>` | One device |
+| `POST /api/devices/<label>/disable`, `/enable` | Disables or enables it |
+| `DELETE /api/devices/<label>` | Revokes its certificates and deletes it |
+| `POST /api/devices/<label>/enrolment-code` | Issues an enrolment code |
+
+For devices, through the proxy:
+
+| Method and path | Authorised by | Body |
+|---|---|---|
+| `POST /v1/enrol` | Enrolment code | `code`, `csr` |
+| `POST /v1/renew` | Current certificate (`X-Client-Verify: SUCCESS` and `X-Client-Cert` from the proxy) | `csr` |
+
+Both answer `{"crt": "<certificate>", "ca": "<intermediate>"}`.
+`GET /healthz` answers `ok` on both roles.
+
+The RA trusts `X-Client-*` headers, so it must be reachable only through the
+proxy (for example published on loopback), and the proxy must set those
+headers itself, replacing any a client sends.
+
+## Configuration
+
+Both roles:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CERT_ENROLMENT_ROLE` | `portal` | `portal` or `ra` |
+| `CERT_ENROLMENT_LISTEN` | `0.0.0.0:8080` | Address and port to listen on (plain HTTP) |
+| `CERT_ENROLMENT_LDAP_URL` | required | LDAP server; must be `ldaps://` |
+| `CERT_ENROLMENT_LDAP_PEOPLE_DN` | required | Users are `uid=<name>,<this DN>` |
+| `CERT_ENROLMENT_DEVICE_DOMAIN` | required | Device identities are `<name>.<this domain>` |
+| `CERT_ENROLMENT_DEVICE_ZONES` | required | Comma-separated zones offered at registration; the first is the default. Must match the zones FreeRADIUS maps to VLANs |
+| `CERT_ENROLMENT_RA_API_KEY_FILE` | required | File holding the key the portal presents to the RA, at least 32 characters |
+| `CERT_ENROLMENT_ROOT_CA_FILE` | `SSL_CERT_FILE` | PEM file with the one Root CA certificate: given to devices (portal) and trusted for step-ca (RA) |
+| `SSL_CERT_FILE` | none | PEM file of CAs trusted for LDAPS. The image has no other trust store |
+
+Portal only:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CERT_ENROLMENT_LDAP_ENROLLERS_GROUP_DN` | required | `posixGroup` whose `memberUid` values may sign in |
+| `CERT_ENROLMENT_RA_URL` | required | The RA's API as the portal reaches it, e.g. `http://cert-enrolment-ra:8080` |
+| `CERT_ENROLMENT_RA_PUBLIC_URL` | required | The RA as devices reach it, `https://host[:port]`; written into scripts |
+| `CERT_ENROLMENT_WIFI_SSID` | required | Trusted network the scripts configure; 1 to 32 printable ASCII characters |
+| `CERT_ENROLMENT_RADIUS_SERVER_NAME` | required | DNS name in the RADIUS server certificate, which devices validate |
+| `CERT_ENROLMENT_SESSION_MINUTES` | `30` | Idle time before a session expires |
+
+RA only:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CERT_ENROLMENT_LDAP_BIND_DN` | required | Service account for device entries |
+| `CERT_ENROLMENT_LDAP_BIND_PASSWORD_FILE` | required | File holding its password |
+| `CERT_ENROLMENT_LDAP_DEVICES_DN` | required | Container of device entries |
+| `CERT_ENROLMENT_CA_URL` | required | step-ca base URL, `https://host[:port]` |
+| `CERT_ENROLMENT_PROVISIONER` | required | Name of the step-ca JWK provisioner |
+| `CERT_ENROLMENT_PROVISIONER_KEY_FILE` | required | File holding its private key as an EC P-256 JWK. Checked at start-up |
 
 ## LDAP requirements
 
 * A posixGroup of enrollers; its `memberUid` values may sign in.
-* A service account that can create, modify and delete entries in the
-  devices container, and nothing else.
-* The `managedDevice` auxiliary object class (`deviceId`, `deviceType`,
-  `deviceZone`, `deviceDisabled`).
+* A service account for the RA that can create, modify and delete entries
+  in the devices container, and nothing else.
+* The `managedDevice` auxiliary object class with `deviceId`, `deviceType`,
+  `deviceZone`, `deviceDisabled` and `deviceCertificate` (multi-valued).
 * LDAPS, with a server certificate that chains to the CA in
   `SSL_CERT_FILE`.
 
-## Configuration
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `CERT_ENROLMENT_LISTEN` | `0.0.0.0:8080` | Address and port to listen on |
-| `CERT_ENROLMENT_LDAP_URL` | required | LDAP server; must be `ldaps://` |
-| `CERT_ENROLMENT_LDAP_PEOPLE_DN` | required | Users sign in as `uid=<name>,<this DN>` |
-| `CERT_ENROLMENT_LDAP_ENROLLERS_GROUP_DN` | required | `posixGroup` whose `memberUid` values may sign in |
-| `CERT_ENROLMENT_LDAP_BIND_DN` | required | Service account for reading and writing device entries |
-| `CERT_ENROLMENT_LDAP_BIND_PASSWORD_FILE` | required | File holding the service account password (for example a container secret) |
-| `CERT_ENROLMENT_LDAP_DEVICES_DN` | required | Container of device entries |
-| `CERT_ENROLMENT_DEVICE_DOMAIN` | required | Device identities are `<name>.<this domain>` |
-| `CERT_ENROLMENT_DEVICE_ZONES` | required | Comma-separated zones offered at registration; the first is the default. Must match the zones FreeRADIUS maps to VLANs |
-| `CERT_ENROLMENT_CA_URL` | required | step-ca base URL as devices reach it; must be `https://`. Tokens are issued for `<this URL>/1.0/sign` |
-| `CERT_ENROLMENT_PROVISIONER` | required | Name of the step-ca JWK provisioner whose key signs enrolment tokens |
-| `CERT_ENROLMENT_PROVISIONER_KEY_FILE` | required | File holding that provisioner's private key as an EC P-256 JWK (for example a container secret). Checked at start-up |
-| `CERT_ENROLMENT_WIFI_SSID` | required | Trusted network the scripts configure; 1 to 32 printable ASCII characters |
-| `CERT_ENROLMENT_RADIUS_SERVER_NAME` | required | DNS name in the RADIUS server certificate, which devices validate |
-| `CERT_ENROLMENT_ROOT_CA_FILE` | `SSL_CERT_FILE` | PEM file with the one Root CA certificate devices are given to trust |
-| `CERT_ENROLMENT_SESSION_MINUTES` | `30` | Idle time before a session expires |
-| `SSL_CERT_FILE` | none | PEM file of CAs trusted for LDAPS. Set it to your Root CA; the image has no other trust store |
-
 ## Deployment
 
-The image listens on plain HTTP and expects a reverse proxy to terminate TLS
-for the portal host name. It runs as an unprivileged user (UID 65532) and
-needs only outbound LDAPS.
+Run the image twice, as the portal and as the RA, on a private container
+network so the portal reaches the RA by name. Both listen on plain HTTP as
+an unprivileged user (UID 65532); publish them on loopback only. A reverse
+proxy terminates TLS:
 
-A reference deployment, using rootless Podman, Quadlet, NGINX and Ansible,
-is the `cert-enrolment` role in
+* for the portal host name (e.g. `join.<domain>`), plainly;
+* for the RA host name (e.g. `ra.<domain>`), with optional client
+  certificates verified against the Root and Intermediate CA, passing
+  `X-Client-Verify` (`$ssl_client_verify` in NGINX) and `X-Client-Cert`
+  (`$ssl_client_escaped_cert`).
+
+Give only the RA the LDAP service account and the provisioner key; give both
+the API key. A reference deployment, using rootless Podman, Quadlet, NGINX
+and Ansible, is the `cert-enrolment` role in
 [elaverick/homelab](https://github.com/elaverick/homelab).
 
-## Dependencies
+## Code layout
 
-Agreed set, each added with the feature that needs it:
+```text
+src/
+├── main.rs      chooses the role
+├── shared/      device model and validation, HTTP helpers, settings, random tokens
+├── portal/      pages, sessions, sign-in, the RA client, enrolment script templates
+└── ra/          API, device records, certificates, enrolment codes, step-ca client, tokens
+```
+
+## Dependencies
 
 | Crate | Purpose |
 |---|---|
 | `tiny_http` | HTTP server |
-| `ldap3` | LDAP sign-in and device entries (sync API, rustls with ring; no OpenSSL) |
-| `p256`, `ecdsa`, `base64`, `serde_json` | Signing step-ca single-use tokens (ES256 JWS) |
+| `ldap3` | LDAP (sync API, rustls with ring; no OpenSSL) |
+| `p256`, `base64`, `serde_json` | Signing step-ca tokens (ES256 JWS); JSON |
+| `ureq` | HTTP client: RA to step-ca (rustls), portal to RA |
+| `x509-parser` | Reading serials, names and expiry from certificates (RA) |
 
-`hmac` and `sha2` were originally planned for signed session cookies.
-Sessions are held in memory instead, so they are not needed. Random tokens
-come from `/dev/urandom`.
+Random tokens come from `/dev/urandom`.
 
 ## Build
 
@@ -318,14 +380,12 @@ request.
 
 * [x] Service skeleton, container image and CI
 * [x] LDAP sign-in restricted to the enrollers group
-* [x] Device registration
-* [x] Disable, enable and delete devices
-* [x] Reference deployment (homelab role, NGINX site and certificate)
-* [x] step-ca JWK provisioner and single-use token signing
-* [x] Linux enrolment script (tested end to end against step-ca, including renewal)
-* [x] Windows enrolment script (enrolled a real Windows 11 device: TPM key, certificate, Wi-Fi profile and renewal task; first real renewal and Wi-Fi connection still to be observed)
+* [x] Device registration, disable, enable and delete
+* [x] Reference deployment (homelab role, NGINX sites and certificates)
+* [x] Linux enrolment script (tested end to end, including renewal)
+* [x] Windows enrolment script (a real Windows 11 device enrolled: TPM key, certificate, Wi-Fi profile, renewal task)
+* [x] Portal and RA roles; renewal through the RA; revocation in step-ca on delete (tested end to end against step-ca 0.30.2)
 * [ ] Onboarding: HTTP bootstrap page with the Root CA, and captive-portal setup
 * [ ] step-ca SCEP provisioner and challenge webhook
 * [ ] iOS enrolment profile
-* [ ] Revoke the certificate in step-ca when a device is deleted, so it cannot renew
 * [ ] Expiry view for devices that renew manually (iOS)
