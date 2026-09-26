@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use tiny_http::{Method, Request, Server};
 
 use config::Config;
-use devices::{Platform, Registration};
+use devices::{Change, Platform, Registration};
 use directory::SignIn;
 use http::{Reply, LOGIN_CSRF_COOKIE, SESSION_COOKIE};
 use session::{random_token, tokens_match, Sessions};
@@ -59,6 +59,9 @@ fn route(config: &Config, sessions: &mut Sessions, request: &mut Request) -> Rep
         (Method::Get, "/style.css") => http::css(pages::STYLE),
         (Method::Get, "/") => home(config, sessions, request),
         (Method::Post, "/devices") => register_device(config, sessions, request),
+        (Method::Post, "/devices/disable") => device_action(config, sessions, request, Action::Disable),
+        (Method::Post, "/devices/enable") => device_action(config, sessions, request, Action::Enable),
+        (Method::Post, "/devices/delete") => device_action(config, sessions, request, Action::Delete),
         (Method::Get, "/login") => sign_in_form(sessions, request),
         (Method::Post, "/login") => sign_in(config, sessions, request),
         (Method::Post, "/logout") => sign_out(sessions, request),
@@ -90,12 +93,53 @@ fn home(config: &Config, sessions: &mut Sessions, request: &Request) -> Reply {
         return http::redirect("/login");
     };
 
-    // Set by the redirect after a successful registration.
-    let registered = http::query_value(request, "registered")
+    // Set by the redirect after a successful change. Both values are
+    // validated, so nothing from the URL reaches the page unchecked.
+    let notice = http::query_value(request, "device")
         .filter(|label| devices::valid_label(label))
-        .map(|label| format!("Registered {}.", devices::device_id(config, label)));
+        .zip(http::query_value(request, "done").and_then(Action::from_done))
+        .map(|(label, action)| format!("{} {}.", action.past_tense(), devices::device_id(config, label)));
 
-    home_page(config, &user, 200, &DeviceForm::default(), registered.as_deref(), None)
+    home_page(config, &user, 200, &DeviceForm::default(), notice.as_deref(), None)
+}
+
+/// Completed changes, as reported back to the home page.
+#[derive(Clone, Copy)]
+enum Action {
+    Register,
+    Disable,
+    Enable,
+    Delete,
+}
+
+impl Action {
+    fn done(self) -> &'static str {
+        match self {
+            Action::Register => "registered",
+            Action::Disable => "disabled",
+            Action::Enable => "enabled",
+            Action::Delete => "deleted",
+        }
+    }
+
+    fn from_done(done: &str) -> Option<Action> {
+        [Action::Register, Action::Disable, Action::Enable, Action::Delete]
+            .into_iter()
+            .find(|action| action.done() == done)
+    }
+
+    fn past_tense(self) -> &'static str {
+        match self {
+            Action::Register => "Registered",
+            Action::Disable => "Disabled",
+            Action::Enable => "Enabled",
+            Action::Delete => "Deleted",
+        }
+    }
+}
+
+fn done_redirect(action: Action, label: &str) -> Reply {
+    http::redirect(&format!("/?done={}&device={label}", action.done()))
 }
 
 fn home_page(
@@ -166,11 +210,57 @@ fn register_device(config: &Config, sessions: &mut Sessions, request: &mut Reque
                 user.username,
                 platform.id()
             );
-            http::redirect(&format!("/?registered={label}"))
+            done_redirect(Action::Register, &label)
         }
         Ok(Registration::AlreadyExists(id)) => {
             let error = format!("{id} is already registered.");
             home_page(config, &user, 409, &refill, None, Some(&error))
+        }
+        Err(err) => {
+            eprintln!("cert-enrolment: {err}");
+            http::html(503, pages::unavailable())
+        }
+    }
+}
+
+/// Disables, enables or deletes the device named by the form's `id`.
+/// Deleting first shows a confirmation page, which posts back with
+/// `confirm=yes`.
+fn device_action(config: &Config, sessions: &mut Sessions, request: &mut Request, action: Action) -> Reply {
+    let Some(user) = signed_in(sessions, request) else {
+        return http::redirect("/login");
+    };
+
+    let Ok(form) = http::read_form(request) else {
+        return http::text(400, "bad request\n");
+    };
+    if !tokens_match(&user.csrf_token, http::form_value(&form, "csrf")) {
+        return http::text(400, "bad request\n");
+    }
+
+    let id = http::form_value(&form, "id");
+    let Some(label) = devices::label_from_id(&config.device_domain, id) else {
+        return home_page(config, &user, 400, &DeviceForm::default(), None, Some("That is not a device name."));
+    };
+
+    let result = match action {
+        Action::Delete if http::form_value(&form, "confirm") != "yes" => {
+            return http::html(200, pages::confirm_delete(id, &user.csrf_token));
+        }
+        Action::Delete => devices::delete(config, label),
+        Action::Disable => devices::set_disabled(config, label, true),
+        Action::Enable => devices::set_disabled(config, label, false),
+        Action::Register => return http::text(404, "not found\n"),
+    };
+
+    match result {
+        Ok(Change::Done) => {
+            eprintln!("cert-enrolment: {} {} {id}", user.username, action.done());
+            done_redirect(action, label)
+        }
+        Ok(Change::NotFound) => {
+            let error = format!("{id} is not registered.");
+            home_page(config, &user, 404, &DeviceForm::default(), None, Some(&error))
         }
         Err(err) => {
             eprintln!("cert-enrolment: {err}");

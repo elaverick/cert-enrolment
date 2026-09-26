@@ -79,6 +79,17 @@ enables it explicitly.
 * Names that already exist are refused. All enrollers see every device.
 * Registrations are logged with the enroller, device, platform and zone.
 
+## Disabling and deleting devices
+
+* Any enroller can disable, enable or delete any device from the list.
+* Disable sets `deviceDisabled: TRUE`; FreeRADIUS then rejects the device
+  at its next association. Enable sets it back to `FALSE`.
+* Delete removes the LDAP entry after a confirmation page (the Content
+  Security Policy allows no script, so there is no browser dialog).
+* Each change is logged with the enroller and device.
+* Certificates are not yet revoked. A disabled or deleted device's
+  certificate stays valid until it expires, but FreeRADIUS refuses it.
+
 ## Dependencies
 
 Agreed set, each added with the feature that needs it:
@@ -148,11 +159,12 @@ and `secret-scan.yaml` runs Gitleaks on every push and pull request.
 * [x] Service skeleton, container image and CI
 * [x] LDAP sign-in restricted to `device-enrollers`
 * [x] Device registration in `ou=Devices`
-* [ ] Disable, enable and delete devices
+* [x] Disable, enable and delete devices
 * [ ] step-ca JWK provisioner and single-use token signing
 * [ ] Windows enrolment script
 * [ ] Linux enrolment script
 * [ ] step-ca SCEP provisioner and challenge webhook
 * [ ] iOS enrolment profile
+* [ ] Revoke the certificate in step-ca when a device is deleted, so it cannot renew
 * [ ] Expiry view for devices that renew manually (iOS)
 * [ ] `homelab` deployment role, NGINX site and certificate

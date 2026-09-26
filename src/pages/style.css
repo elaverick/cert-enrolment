@@ -9,6 +9,8 @@
   --accent-text: #ffffff;
   --error: #b42318;
   --notice: #067647;
+  --danger: #b42318;
+  --danger-text: #ffffff;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -22,6 +24,8 @@
     --accent-text: #0d1117;
     --error: #f97066;
     --notice: #47cd89;
+    --danger: #f97066;
+    --danger-text: #0d1117;
   }
 }
 
@@ -71,6 +75,7 @@ button {
 
 h2 { margin: 2rem 0 0.75rem; font-size: 1.1rem; }
 
+.table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
 th, td { padding: 0.45rem 0.5rem; text-align: left; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 600; }
@@ -80,7 +85,34 @@ td:first-child { overflow-wrap: anywhere; }
 .suffixed input { flex: 1; min-width: 0; }
 .suffixed span { color: var(--muted); white-space: nowrap; }
 
-button.secondary { color: var(--text); background: transparent; border: 1px solid var(--border); }
+a.button {
+  display: inline-block;
+  margin-top: 1.5rem;
+  padding: 0.6rem 1.2rem;
+  font-weight: 600;
+  text-decoration: none;
+  border-radius: 6px;
+}
+
+button.secondary, a.button.secondary { color: var(--text); background: transparent; border: 1px solid var(--border); }
+button.danger { color: var(--danger-text); background: var(--danger); }
+button.small { margin: 0; padding: 0.25rem 0.6rem; font-size: 0.85rem; }
+
+.actions { white-space: nowrap; text-align: right; }
+.actions form { display: inline; }
+.actions form + form { margin-left: 0.35rem; }
+
+.button-row { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+.button-row button, .button-row a.button { margin-top: 1rem; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 .sign-out { margin-top: 2rem; border-top: 1px solid var(--border); }
 
 .error { color: var(--error); font-weight: 600; }

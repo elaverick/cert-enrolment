@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use ldap3::{dn_escape, LdapConn, LdapConnSettings, LdapError, Scope, SearchEntry};
+use ldap3::{dn_escape, LdapConn, LdapConnSettings, LdapError, Mod, Scope, SearchEntry};
 
 use crate::config::Config;
 
@@ -15,6 +15,9 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// LDAP result code for an add whose DN already exists.
 const ENTRY_ALREADY_EXISTS: u32 = 68;
+
+/// LDAP result code for an operation on a DN that does not exist.
+const NO_SUCH_OBJECT: u32 = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -73,6 +76,48 @@ pub fn device_id(config: &Config, label: &str) -> String {
     format!("{label}.{}", config.device_domain)
 }
 
+/// Returns the label of a well-formed device id in the device domain.
+pub fn label_from_id<'a>(device_domain: &str, id: &'a str) -> Option<&'a str> {
+    let label = id.strip_suffix(device_domain)?.strip_suffix('.')?;
+    valid_label(label).then_some(label)
+}
+
+fn device_dn(config: &Config, label: &str) -> String {
+    format!("cn={},{}", dn_escape(device_id(config, label)), config.ldap_devices_dn)
+}
+
+pub enum Change {
+    Done,
+    NotFound,
+}
+
+pub fn set_disabled(config: &Config, label: &str, disabled: bool) -> Result<Change, String> {
+    let value = if disabled { "TRUE" } else { "FALSE" };
+    let mods = vec![Mod::Replace("deviceDisabled", HashSet::from([value]))];
+
+    let mut ldap = connect(config)?;
+    let result = ldap.with_timeout(TIMEOUT).modify(&device_dn(config, label), mods);
+    let _ = ldap.unbind();
+
+    change_outcome(result, &format!("setting deviceDisabled={value} on {label}"))
+}
+
+pub fn delete(config: &Config, label: &str) -> Result<Change, String> {
+    let mut ldap = connect(config)?;
+    let result = ldap.with_timeout(TIMEOUT).delete(&device_dn(config, label));
+    let _ = ldap.unbind();
+
+    change_outcome(result, &format!("deleting {label}"))
+}
+
+fn change_outcome(result: ldap3::result::Result<ldap3::LdapResult>, action: &str) -> Result<Change, String> {
+    match result.map(|result| result.success()) {
+        Ok(Ok(_)) => Ok(Change::Done),
+        Ok(Err(LdapError::LdapResult { result })) if result.rc == NO_SUCH_OBJECT => Ok(Change::NotFound),
+        Ok(Err(err)) | Err(err) => Err(format!("{action} failed: {err}")),
+    }
+}
+
 pub fn list(config: &Config) -> Result<Vec<Device>, String> {
     let mut ldap = connect(config)?;
 
@@ -118,7 +163,7 @@ pub fn register(
     owner: &str,
 ) -> Result<Registration, String> {
     let id = device_id(config, label);
-    let dn = format!("cn={},{}", dn_escape(&id), config.ldap_devices_dn);
+    let dn = device_dn(config, label);
     let owner_dn = format!("uid={},{}", dn_escape(owner), config.ldap_people_dn);
 
     let attrs = vec![
@@ -172,6 +217,22 @@ mod tests {
     fn rejects_non_labels() {
         for label in ["", "-a", "a-", "Laptop", "a.b", "a_b", "a b", &"a".repeat(64)] {
             assert!(!valid_label(label), "{label:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn extracts_labels_from_device_ids() {
+        let domain = "device.laverick.home.arpa";
+        assert_eq!(label_from_id(domain, "ed-laptop.device.laverick.home.arpa"), Some("ed-laptop"));
+        for id in [
+            "device.laverick.home.arpa",
+            ".device.laverick.home.arpa",
+            "a.b.device.laverick.home.arpa",
+            "ed-laptopdevice.laverick.home.arpa",
+            "ed-laptop.other.home.arpa",
+            "Ed.device.laverick.home.arpa",
+        ] {
+            assert_eq!(label_from_id(domain, id), None, "{id:?} should be rejected");
         }
     }
 

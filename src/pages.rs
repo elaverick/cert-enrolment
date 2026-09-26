@@ -57,12 +57,19 @@ pub fn home(view: &Home) -> String {
         .iter()
         .map(|device| {
             let platform = Platform::from_id(&device.platform).map_or(device.platform.as_str(), |p| p.label());
-            let status = if device.disabled { "Disabled" } else { "Enabled" };
+            let (status, toggle_action, toggle_label) = if device.disabled {
+                ("Disabled", "enable", "Enable")
+            } else {
+                ("Enabled", "disable", "Disable")
+            };
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{status}</td></tr>\n",
-                escape(&device.id),
-                escape(platform),
-                escape(&device.zone),
+                r#"<tr><td>{id}</td><td>{platform}</td><td>{zone}</td><td>{status}</td><td class="actions">{toggle}{delete}</td></tr>
+"#,
+                id = escape(&device.id),
+                platform = escape(platform),
+                zone = escape(&device.zone),
+                toggle = action_form(toggle_action, toggle_label, &device.id, view.csrf_token, "secondary"),
+                delete = action_form("delete", "Delete", &device.id, view.csrf_token, "danger"),
             )
         })
         .collect();
@@ -71,11 +78,11 @@ pub fn home(view: &Home) -> String {
         r#"<p class="muted">No devices are registered yet.</p>"#.to_string()
     } else {
         format!(
-            r#"<table>
-<thead><tr><th scope="col">Device</th><th scope="col">Platform</th><th scope="col">Zone</th><th scope="col">Status</th></tr></thead>
+            r#"<div class="table-wrap"><table>
+<thead><tr><th scope="col">Device</th><th scope="col">Platform</th><th scope="col">Zone</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead>
 <tbody>
 {rows}</tbody>
-</table>"#
+</table></div>"#
         )
     };
 
@@ -128,6 +135,41 @@ pub fn home(view: &Home) -> String {
             csrf = escape(view.csrf_token),
             label = escape(view.label),
             domain = escape(view.device_domain),
+        ),
+    )
+}
+
+/// A one-button form that posts a device id to /devices/<action>. The
+/// accessible name includes the device, since the buttons repeat per row.
+fn action_form(action: &str, label: &str, id: &str, csrf_token: &str, class: &str) -> String {
+    format!(
+        r#"<form method="post" action="/devices/{action}">
+<input type="hidden" name="csrf" value="{csrf}">
+<input type="hidden" name="id" value="{id}">
+<button type="submit" class="small {class}" aria-label="{label} {id}">{label}</button>
+</form>"#,
+        csrf = escape(csrf_token),
+        id = escape(id),
+    )
+}
+
+pub fn confirm_delete(id: &str, csrf_token: &str) -> String {
+    page(
+        "Delete device",
+        &format!(
+            r#"<p>Delete <strong>{id}</strong>?</p>
+<p>It will no longer be able to join the trusted network. To use it again, register and enrol it again.</p>
+<form method="post" action="/devices/delete">
+<input type="hidden" name="csrf" value="{csrf}">
+<input type="hidden" name="id" value="{id}">
+<input type="hidden" name="confirm" value="yes">
+<div class="button-row">
+<button type="submit" class="danger">Delete device</button>
+<a href="/" class="button secondary">Cancel</a>
+</div>
+</form>"#,
+            id = escape(id),
+            csrf = escape(csrf_token),
         ),
     )
 }
