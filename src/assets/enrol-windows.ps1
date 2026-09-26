@@ -98,18 +98,21 @@ function New-DeviceRequest([string] $DeviceId, [string] $Provider, [string] $Wor
 # Installs an issued certificate, joined to the key of its pending request,
 # plus its intermediate CA. Returns the installed certificate.
 function Install-DeviceCertificate($Response, [string] $DeviceId, [string] $WorkDir) {
-    $crt = Join-Path $WorkDir 'device.crt'
-    Set-Content -Path $crt -Value $Response.crt -Encoding ASCII
-    $output = & certreq.exe -accept -q -machine $crt 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "certreq could not install the certificate: $($output -join ' ')"
-    }
-
+    # certreq -accept builds the chain to a trusted root before installing,
+    # and the certificates carry no link to fetch the intermediate from, so
+    # the intermediate must already be in the Intermediate CAs store.
     if ($Response.ca) {
         $intermediate = ConvertFrom-Pem $Response.ca
         $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('CA', 'LocalMachine')
         $store.Open('ReadWrite')
         try { $store.Add($intermediate) } finally { $store.Close() }
+    }
+
+    $crt = Join-Path $WorkDir 'device.crt'
+    Set-Content -Path $crt -Value $Response.crt -Encoding ASCII
+    $output = & certreq.exe -accept -q -machine $crt 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "certreq could not install the certificate: $($output -join ' ')"
     }
 
     $issued = ConvertFrom-Pem $Response.crt
@@ -232,7 +235,12 @@ try {
         }
         throw "Could not reach the certificate authority at ${CaUrl}: $($_.Exception.Message) The enrolment token has not been used; run the script again within ten minutes of downloading it."
     }
-    $certificate = Install-DeviceCertificate -Response $response -DeviceId $DeviceId -WorkDir $work
+    try {
+        $certificate = Install-DeviceCertificate -Response $response -DeviceId $DeviceId -WorkDir $work
+    } catch {
+        Remove-PendingRequests -DeviceId $DeviceId
+        throw "The certificate was issued but could not be installed: $($_.Exception.Message) The enrolment token has been used; download a new script from the Enrol page."
+    }
     Remove-OtherDeviceCertificates -DeviceId $DeviceId -Keep $certificate.Thumbprint
     Write-Host "    Installed; valid until $($certificate.NotAfter)"
 
